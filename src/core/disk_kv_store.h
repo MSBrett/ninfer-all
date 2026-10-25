@@ -16,6 +16,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <shared_mutex>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -23,6 +24,9 @@
 #include <vector>
 
 namespace ninfer {
+
+class DirectStorageReader;
+struct FileRangeRead;
 
 // Content identity of one stored page: the engine's rolling prefix digest at the page's last
 // token, the engine configuration tag, and that frontier.
@@ -101,6 +105,10 @@ public:
     };
 
     [[nodiscard]] std::optional<ReadClaim> claim_read(const DiskKVIdentity& id);
+    // Windows DirectStorage opens files read-only. Pause file I/O and release the writable
+    // mapping for this batch, then restore it before any writer or mapped fallback resumes.
+    [[nodiscard]] bool read_direct(DirectStorageReader& reader,
+                                    std::span<const FileRangeRead> reads);
     // Checks bytes read for a claim against its CRC (when verification is on).
     [[nodiscard]] bool claim_intact(const ReadClaim& claim,
                                     std::span<const std::byte> payload) const noexcept;
@@ -190,6 +198,7 @@ private:
     std::intptr_t file_handle_ = -1;
 #ifdef _WIN32
     std::intptr_t mapping_handle_ = -1;
+    std::shared_mutex file_io_mutex_;
 #endif
     std::unordered_map<DiskKVIdentity, std::uint32_t, DiskKVIdentityHash> index_;
     std::vector<std::uint32_t> free_slots_;

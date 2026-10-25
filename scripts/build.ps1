@@ -22,12 +22,15 @@
 #   .\scripts\build.ps1 -Benchmarks      ... include bench\ (implied by -Package)
 #   .\scripts\build.ps1 -Clean           delete the build directory first
 #   .\scripts\build.ps1 -Target ninfer-serve
+#   .\scripts\build.ps1 -Arch 89 -DirectStorage -Package -Jobs 2
 [CmdletBinding()]
 param(
     [switch]$Test,
     [switch]$Package,
     [switch]$Clean,
     [switch]$Benchmarks,
+    [switch]$DirectStorage,
+    [ValidateRange(0, 1024)][int]$Jobs = 0,
     [string]$Target,
     [string]$BuildDir,
     [ValidateSet('75', '80', '86', '89')][string]$Arch = '86'
@@ -65,6 +68,8 @@ MSVC 14.50 is rejected by CUDA 12.8.
 }
 
 $CudaCandidates = @(
+    if ($env:CUDACXX) { $env:CUDACXX }
+    if ($env:CUDA_PATH) { Join-Path $env:CUDA_PATH 'bin/nvcc.exe' }
     'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin\nvcc.exe',
     'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9\bin\nvcc.exe'
 )
@@ -84,6 +89,7 @@ cmd /c "`"$VcVars`" >nul 2>&1 && set" | ForEach-Object {
     if ($_ -match '^([^=]+)=(.*)$') { Set-Item -Path "Env:$($Matches[1])" -Value $Matches[2] }
 }
 $env:CUDACXX = $Nvcc
+$env:CUDA_PATH = Split-Path -Parent (Split-Path -Parent $Nvcc)
 
 $cl = (Get-Command cl.exe -ErrorAction SilentlyContinue)
 if ($cl) { Write-Host "toolchain: $($cl.Source)" }
@@ -101,11 +107,16 @@ try {
     # that begins with "-D", and cmake then sees the literal "$Arch".
     $RuntimeOption = if ($Package) { 'ON' } else { 'OFF' }
     $BenchmarksOption = if ($BuildBenchmarks) { 'ON' } else { 'OFF' }
+    $DirectStorageOption = if ($DirectStorage) { 'ON' } else { 'OFF' }
+    $TestingOption = if ($Test) { 'ON' } else { 'OFF' }
     cmake -S . -B $BuildDir -G Ninja '-DCMAKE_BUILD_TYPE=Release' "-DCMAKE_CUDA_ARCHITECTURES=$Arch" `
-          "-DNINFER_BUILD_BENCHMARKS=$BenchmarksOption" "-DNINFER_SHARED_RUNTIME=$RuntimeOption"
+          "-DCMAKE_CUDA_COMPILER=$Nvcc" "-DCUDAToolkit_ROOT=$env:CUDA_PATH" `
+          "-DNINFER_BUILD_BENCHMARKS=$BenchmarksOption" "-DNINFER_SHARED_RUNTIME=$RuntimeOption" `
+          "-DNINFER_DIRECTSTORAGE=$DirectStorageOption" "-DBUILD_TESTING=$TestingOption"
     if ($LASTEXITCODE -ne 0) { throw "configure failed ($LASTEXITCODE)" }
 
-    $buildArgs = @('--build', $BuildDir)
+    $buildArgs = @('--build', $BuildDir, '-j')
+    if ($Jobs -gt 0) { $buildArgs += $Jobs }
     if ($Target) { $buildArgs += @('--target', $Target) }
     cmake @buildArgs
     if ($LASTEXITCODE -ne 0) { throw "build failed ($LASTEXITCODE)" }

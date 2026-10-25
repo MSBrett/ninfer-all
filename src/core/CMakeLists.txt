@@ -1,3 +1,15 @@
+# Host-only disk storage has no CUDA dependency and can be qualified on a Windows build host.
+add_library(ninfer_disk_kv STATIC
+  disk_kv_store.cpp
+  disk_kv_bridge.cpp
+  direct_storage_reader.cpp
+)
+ninfer_internal_includes(ninfer_disk_kv)
+target_link_libraries(ninfer_disk_kv PUBLIC Threads::Threads)
+if(WIN32 AND NINFER_DIRECTSTORAGE)
+  target_link_libraries(ninfer_disk_kv PUBLIC ninfer_directstorage)
+endif()
+
 add_library(ninfer_core STATIC
   arena.cu
   device.cu
@@ -14,9 +26,6 @@ add_library(ninfer_core STATIC
   gdn_replay_records.cpp
   cyclic_kv_cache.cpp
   host_kv_arena.cpp
-  disk_kv_store.cpp
-  disk_kv_bridge.cpp
-  direct_storage_reader.cpp
   file_read_queue.cpp
   paged_kv_cache.cpp
   kv_expert_loan.cpp
@@ -40,7 +49,8 @@ string(REPLACE ";" " " _ninfer_cuda_architectures "${CMAKE_CUDA_ARCHITECTURES}")
 set_source_files_properties(device.cu PROPERTIES
   COMPILE_DEFINITIONS "NINFER_CUDA_ARCHITECTURES=\"${_ninfer_cuda_architectures}\"")
 ninfer_cuda_archive(ninfer_core)
-target_link_libraries(ninfer_core PUBLIC ${NINFER_CUDART_TARGET} CUDA::nvtx3 Threads::Threads CUDA::cuda_driver)
+target_link_libraries(ninfer_core PUBLIC
+  ninfer_disk_kv ${NINFER_CUDART_TARGET} CUDA::nvtx3 Threads::Threads CUDA::cuda_driver)
 if(MSVC)
   # --help must run on build hosts without an NVIDIA driver. Resolve driver entry points only
   # when execution uses them; the CUDA runtime still checks device availability at startup.
@@ -49,6 +59,3 @@ if(MSVC)
 endif()
 # gpu_clock_floor.cpp loads NVML at run time.
 target_link_libraries(ninfer_core PRIVATE ${CMAKE_DL_LIBS})
-if(WIN32 AND NINFER_DIRECTSTORAGE)
-  target_link_libraries(ninfer_core PUBLIC ninfer_directstorage)
-endif()

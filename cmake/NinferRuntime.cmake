@@ -52,9 +52,4 @@ function(ninfer_finalize_runtime)
     target_link_options(ninfer_runtime PRIVATE "LINKER:--exclude-libs,ALL")
   endif()
   ninfer_stage_runtime_dlls(ninfer_runtime)
-  if(WIN32 AND NINFER_DIRECTSTORAGE)
-    add_custom_command(TARGET ninfer_runtime POST_BUILD
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different ${NINFER_DIRECTSTORAGE_DLLS}
-              $<TARGET_FILE_DIR:ninfer_runtime>)
-  endif()
 endfunction()

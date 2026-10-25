@@ -61,17 +61,41 @@ set_tests_properties(
   ninfer_suspend_memory_test
   PROPERTIES SKIP_RETURN_CODE 77)
 
-ninfer_add_test(ninfer_disk_kv_store_test
+ninfer_add_test(ninfer_disk_kv_store_test STANDALONE
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_disk_kv_store.cpp"
-  LIBRARIES ninfer_core)
+  LIBRARIES ninfer_disk_kv)
 
 ninfer_add_test(ninfer_file_read_queue_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_file_read_queue.cpp"
   LIBRARIES ninfer_core)
 
-ninfer_add_test(ninfer_disk_kv_bridge_test
+ninfer_add_test(ninfer_disk_kv_bridge_test STANDALONE
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_disk_kv_bridge.cpp"
-  LIBRARIES ninfer_core)
+  LIBRARIES ninfer_disk_kv)
+
+ninfer_add_test(ninfer_directstorage_test STANDALONE
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_direct_storage_reader.cpp"
+  LIBRARIES ninfer_disk_kv)
+foreach(test IN ITEMS ninfer_disk_kv_store_test ninfer_disk_kv_bridge_test ninfer_directstorage_test)
+  ninfer_stage_runtime_dlls(${test})
+endforeach()
+
+
+# A shared backend loads its optional SDK after LoadLibraryEx has finished resolving
+# imports. Qualify the real reader with DLLs only beside that backend, never via PATH.
+if(WIN32 AND NINFER_DIRECTSTORAGE)
+  add_library(ninfer_directstorage_backend_probe SHARED
+    "${CMAKE_CURRENT_LIST_DIR}/../host/directstorage_backend_probe.cpp")
+  ninfer_internal_includes(ninfer_directstorage_backend_probe)
+  target_link_libraries(ninfer_directstorage_backend_probe PRIVATE ninfer_disk_kv)
+  set_target_properties(ninfer_directstorage_backend_probe PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/directstorage-backend/$<0:>")
+  ninfer_stage_runtime_dlls(ninfer_directstorage_backend_probe)
+  add_dependencies(ninfer_directstorage_test ninfer_directstorage_backend_probe)
+  add_test(NAME ninfer_directstorage_backend_test
+    COMMAND ninfer_directstorage_test --backend-probe
+      $<TARGET_FILE:ninfer_directstorage_backend_probe>)
+endif()
 
 ninfer_add_test(ninfer_device_test       SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_device.cu"
   LIBRARIES ninfer_ops)

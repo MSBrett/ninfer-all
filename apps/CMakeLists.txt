@@ -64,11 +64,3 @@ if(NINFER_MULTICALL)
               $<TARGET_FILE_DIR:ninfer-multicall>/${name})
   endforeach()
 endif()
-
-if(WIN32 AND NINFER_DIRECTSTORAGE AND NOT NINFER_SHARED_RUNTIME)
-  foreach(app IN ITEMS ninfer ninfer-serve)
-    add_custom_command(TARGET ${app} POST_BUILD
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different ${NINFER_DIRECTSTORAGE_DLLS}
-              $<TARGET_FILE_DIR:${app}>)
-  endforeach()
-endif()

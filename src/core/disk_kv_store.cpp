@@ -1,4 +1,5 @@
 #include "core/disk_kv_store.h"
+#include "core/direct_storage_reader.h"
 
 #include <algorithm>
 #include <array>
@@ -178,6 +179,7 @@ void DiskKVStore::unmap_file() noexcept {
 }
 
 bool DiskKVStore::write_payload(std::uint32_t slot, std::span<const std::byte> bytes) noexcept {
+    std::shared_lock io(file_io_mutex_);
     const HANDLE file = reinterpret_cast<HANDLE>(file_handle_);
     std::size_t done  = 0;
     while (done < bytes.size()) {
@@ -197,6 +199,7 @@ bool DiskKVStore::write_payload(std::uint32_t slot, std::span<const std::byte> b
 }
 
 bool DiskKVStore::read_payload(std::uint32_t slot, std::span<std::byte> destination) noexcept {
+    std::shared_lock io(file_io_mutex_);
     const HANDLE file = reinterpret_cast<HANDLE>(file_handle_);
     std::size_t done  = 0;
     while (done < destination.size()) {
@@ -503,6 +506,28 @@ std::optional<DiskKVStore::ReadClaim> DiskKVStore::claim_read(const DiskKVIdenti
     const std::uint32_t slot = found->second;
     ++readers_[slot];
     return ReadClaim{.slot = slot, .offset = payload_offset(slot), .crc = header(slot).crc};
+}
+
+bool DiskKVStore::read_direct(DirectStorageReader& reader,
+                              std::span<const FileRangeRead> reads) {
+#ifdef _WIN32
+    // Payload transfers take file_io_mutex_ outside mutex_. This order waits for active I/O
+    // before freezing metadata, without blocking a transfer behind its own completion.
+    std::unique_lock io(file_io_mutex_);
+    std::lock_guard metadata(mutex_);
+    unmap_file();
+    bool read = false;
+    try {
+        read = reader.read(options_.path, reads);
+    } catch (...) {
+        map_file(false);
+        throw;
+    }
+    map_file(false);
+    return read;
+#else
+    return reader.read(options_.path, reads);
+#endif
 }
 
 bool DiskKVStore::claim_intact(const ReadClaim& claim,

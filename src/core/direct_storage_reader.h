@@ -1,9 +1,10 @@
 #pragma once
 
 // Reads file ranges into host memory through Microsoft DirectStorage, on Windows builds with
-// NINFER_DIRECTSTORAGE: every range of a batch goes to the NVMe queue at once, with little CPU
-// work per read. Other builds have no reader, and callers keep their mapped-file reads.
+// NINFER_DIRECTSTORAGE: ranges are submitted together through a persistent SDK queue.
+// Other builds have no reader, and callers keep their ordinary file reads.
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -28,11 +29,14 @@ public:
     }
 
     // Throws when this build or machine has no working DirectStorage.
-    [[nodiscard]] static std::unique_ptr<DirectStorageReader> open();
+    [[nodiscard]] static std::unique_ptr<DirectStorageReader>
+    open(std::chrono::milliseconds batch_timeout = std::chrono::seconds(10));
 
     virtual ~DirectStorageReader() = default;
 
     // Reads every range of the file at `path` (UTF-8); false when any read failed.
+    // No request can access a destination after this returns, including after a timeout.
+    // A timeout closes the queue before fallback; closing may wait for issued I/O to settle.
     [[nodiscard]] virtual bool read(const std::string& path,
                                     std::span<const FileRangeRead> reads) = 0;
 };

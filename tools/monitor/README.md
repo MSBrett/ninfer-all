@@ -12,7 +12,10 @@ server's `--request-log-jsonl` file, and serves a self-contained dashboard: sche
 admitted requests, decode and prefill throughput, Device and Host KV use, speculative acceptance,
 TTFT and processing time (TTFT less queue wait), GPU, CPU and RAM, KV and state transfers,
 pressure events (evictions, demotions, degradations, fallbacks), cache-reuse paths, and the recent
-requests. `/api/samples` returns the same state as JSON and `/healthz` answers `ok`.
+requests. Hybrid host-cache usage and capacity come from `context_cache.hybrid.host_used_bytes`
+and `host_capacity_bytes`, including both KV blocks and state snapshots. The legacy cache uses
+its separate host-KV capacity and state slots. `/api/samples` returns the same state as JSON and
+`/healthz` answers `ok`.
 
 ```bash
 python3 tools/monitor/monitor.py --stats-url http://127.0.0.1:8081 \
@@ -20,7 +23,8 @@ python3 tools/monitor/monitor.py --stats-url http://127.0.0.1:8081 \
 ```
 
 The dashboard binds `127.0.0.1` unless `--bind` says otherwise. The last 4320 samples (6 hours at
-5 s) are kept in memory.
+5 s) are kept in memory. A sidecar restart replays existing request-log records to restore
+request metrics; sampled chart history starts again at the restart.
 
 `--sensor-command` adds a temperature reading: a command that prints one Celsius value, run every
 tick, drawn against `--sensor-warn-c` and `--sensor-critical-c` under `--sensor-label`. With

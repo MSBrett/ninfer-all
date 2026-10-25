@@ -1,0 +1,4 @@
+[mcp_servers.serena]
+command = "C:/Users/brett/.local/bin/serena.exe"
+args = ["start-mcp-server", "--context=codex", "--project-from-cwd"]
+cwd = "C:/src/maenifold-rs"

@@ -136,7 +136,7 @@ rem An explicit NINFER_MODEL_DIR is taken verbatim and never probed, as in run.s
 rem downloaded there with download-model.bat is found here.
 if not "%NINFER_MODEL_DIR%"=="" set "MODEL=%NINFER_MODEL_DIR%\%ARTIFACT%"
 set "HOST=127.0.0.1"
-set "PORT=8080"
+set "PORT=8899"
 set "KV_DTYPE=rk4v4"
 if not "%NINFER_MODEL%"=="" set "MODEL=%NINFER_MODEL%"
 if not "%NINFER_HOST%"=="" set "HOST=%NINFER_HOST%"

@@ -251,6 +251,20 @@ jobs:
           $builds = @('${{ matrix.build.archs }}'.Split(' ') | ForEach-Object { "build-$($_ -replace ';', '_')" })
           python -u scripts/check-host-compile.py $builds --shard ${{ matrix.shard }}/3 --jobs 4
 
+      - name: Build and run Windows disk storage with and without DirectStorage
+        if: matrix.shard == 1
+        shell: pwsh
+        run: |
+          $build = "build-$('${{ matrix.build.archs }}' -replace ';', '_')"
+          foreach ($mode in 'ON', 'OFF') {
+            cmake -S . -B $build "-DNINFER_DIRECTSTORAGE=$mode"
+            if ($LASTEXITCODE -ne 0) { throw "Storage configure ($mode) failed" }
+            cmake --build $build -j --target ninfer_directstorage_test ninfer_disk_kv_store_test ninfer_disk_kv_bridge_test
+            if ($LASTEXITCODE -ne 0) { throw "Storage build ($mode) failed" }
+            ctest --test-dir $build --output-on-failure -R '^ninfer_(directstorage(_backend)?|disk_kv_store|disk_kv_bridge)_test$'
+            if ($LASTEXITCODE -ne 0) { throw "Storage tests ($mode) failed" }
+          }
+
   linux-scripts:
     needs: build-inputs
     if: needs.build-inputs.outputs.linux_scripts == 'true'

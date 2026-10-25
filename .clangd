@@ -3,6 +3,9 @@ CompileFlags:
     - -forward-unknown-to-host-compiler
     - --generate-code=*
     - -rdc=true
+    - -Xcompiler=*
+    - -Xfatbin=*
+    - -compress-mode=*
   Add:
-    - --cuda-gpu-arch=sm_120a
-    - --cuda-path=/usr/local/cuda-13.1
+    # Parse the RTX 4090 workspace as Ada. Build targets remain in CMake.
+    - --cuda-gpu-arch=sm_89

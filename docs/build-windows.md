@@ -19,7 +19,11 @@ without the Toolkit on `PATH`. It has no GPU and does not qualify inference or p
 The October 22 [dual-CUDA release run](https://github.com/iamwavecut/ninfer-all/actions/runs/39741764110)
 completed native linking, device-image checks, startup checks, archive verification and upload
 for both variants.
-The Windows-only DirectStorage option below has not been run.
+The optional DirectStorage reader and disk-KV bridge were qualified on Windows on October 25,
+2026 with MSVC 14.44, the Windows 10.0.18362 SDK and DirectStorage 1.3.0. Enabled and disabled
+host-only builds passed the storage tests, including real file reads, concurrent writers, CRC
+failures and timeout cleanup. The complete `ninfer_core` static target also built for `sm_89`
+with CUDA 12.8. This does not qualify GPU inference or establish a throughput gain.
 
 MSVC builds delay-load `nvcuda.dll`, so `--help` can run without an NVIDIA driver.
 GPU execution still requires a compatible driver and device.
@@ -45,15 +49,21 @@ imports the compiler together with `INCLUDE` and `LIB`; adding only the compiler
 
 ## Build
 
-`scripts\build.ps1` imports the VS 2022 BuildTools environment itself, forces CUDA 12.8 and the
-Ninja generator, and builds into `build-ninja`:
+`scripts\build.ps1` imports the VS 2022 BuildTools environment itself and uses the Ninja
+generator. It accepts an explicit `CUDACXX` or `CUDA_PATH`, otherwise selecting the installed
+CUDA 12.8 or 12.9 toolchain, and builds into `build-ninja`:
 
 ```powershell
 .\scripts\build.ps1                       # configure and build
 .\scripts\build.ps1 -Test                 # then run the test suite
 .\scripts\build.ps1 -Target ninfer-serve  # one target
 .\scripts\build.ps1 -Arch 89              # another architecture (75, 80, 86 or 89)
+.\scripts\build.ps1 -Arch 89 -DirectStorage -Package -Jobs 2 # optional SDK, portable archive, two build jobs
 ```
+
+The default build uses the generator's parallelism. Use `-Jobs 2` to limit compiler and
+assembler processes during an interactive desktop session. `-DirectStorage` enables the
+optional SDK path; `-Test` runs tests only when explicitly requested.
 
 The same build by hand:
 
@@ -83,25 +93,83 @@ card's memory. Every Windows build offers `--wddm-evictable-budget`, which sizes
 the card's memory less the weights and a 512 MiB desktop floor instead of what is free at startup,
 and commits the device arenas at startup. Another process that later takes memory makes WDDM page
 some of this process's memory out, which slows generation until it comes back. The Windows-only
-build option, untested:
+build option:
 
 | option | effect |
 |---|---|
-| `NINFER_DIRECTSTORAGE=ON` | fetches the DirectStorage 1.3 runtime and offers `--disk-kv-directstorage` for disk-tier restores |
+| `NINFER_DIRECTSTORAGE=ON` | fetches the pinned DirectStorage 1.3.0 SDK/runtime (latest stable, checked October 25, 2026) and offers `--disk-kv-directstorage` for disk-tier restores |
 
 The other build options are in the [Linux guide](build-linux.md#build-options).
+
+### Remaining DirectStorage work
+
+The host reader, disk-KV bridge and `sm_89` Core build are qualified as described above.
+The October 25 development batch also fixes SDK discovery beside a portable backend DLL,
+adds Windows CI coverage, and exposes `-DirectStorage` and `-Jobs` in the Windows build script.
+The backend-loading probe failed before that fix; the completed batch still needs verification.
+The following work remains before claiming a qualified inference path or a performance benefit.
+Keep `NINFER_DIRECTSTORAGE` optional and off by default. SDK and queue behavior are described in
+[serving](serving.md); host-test commands are in [tests](../tests/README.md#build-and-run).
+
+1. **Build and package the complete Windows product.** Build and link the server and shared
+   runtime for `sm_89` with DirectStorage enabled, using the supported release toolchains.
+   Produce and extract a real release archive. Completion requires both SDK DLLs and
+   `DirectStorage-LICENSE.txt` in each enabled backend, successful startup with development
+   directories removed from `PATH`, and a clear error when DirectStorage is requested without
+   its DLLs. The Core archive build, staging fixtures and package-script syntax check already
+   passed; they do not establish a complete product link or archive result.
+
+2. **Qualify real Engine restores on a Windows RTX 4090.** Use the latest official Qwen3.8-27B
+   `.ninfer` artifact (the engine's Qwen3.5-core architecture) and `--use-original-prefix-caching --disk-kv-restore --disk-kv-path PATH`.
+   Populate the disk tier, restart with no resident prefix, then compare the same persisted
+   pages with and without `--disk-kv-directstorage`. Completion requires proof of actual
+   DirectStorage use, byte-identical restored KV/state and matching deterministic continuation
+   against the ordinary disk-reader baseline. Cover single and concurrent requests, and the
+   speculative backend intended for release. Use port `8899` for this Windows qualification.
+   The current task uses the local RTX 4090; confirm it is free before execution and leave
+   other applications alone. Remote qualification uses the project's
+   [rented-host workflow](../scripts/pods/README.md); Linux-only hosts cannot qualify this
+   Windows path. Record unavailable hardware or artifacts as prerequisites.
+
+3. **Exercise failure recovery through Engine.** Extend that workload with missing and corrupt
+   pages, failed reads and timeout cleanup while cache writers are active. Completion requires
+   safe fallback or prompt recomputation, released page claims, reusable destinations and a
+   successful later request. Record queue-close latency under failure: the 10-second wait
+   deadline does not bound how long issued I/O takes to settle. Existing host tests establish
+   reader/bridge behavior, not complete Engine recovery.
+
+4. **Measure whether DirectStorage helps.** Compare the enabled runtime option against the
+   existing eight-reader positioned-I/O path in the same build, with the same artifact, prompts,
+   concurrency, cache contents, NVMe volume, KV format and speculative settings. Separate cold
+   and warm OS-cache conditions. Report restored bytes, restore time, time to first token, CPU
+   cost and writer/request stalls, including the distribution and worst regressions. The
+   per-batch mapping/handle changes have a cost; do not infer an inference gain from API tests
+   or an I/O-only result. Completion is a representative result and an explicit disposition
+   of any regressions, not a selected best case.
+
+5. **Make regression coverage repeatable.** Windows CI now has enabled/disabled host storage
+   runs, including the real SDK and the shared-backend loading regression, on the first shard
+   of each CUDA configuration. Those jobs still need a recorded passing run. Build the new
+   host-only storage target and run its disabled-path tests on Linux to check the Core target
+   split and ordinary file-I/O behavior. Completion requires recorded passing jobs; neither
+   Linux compilation nor automated Windows coverage was established by the local checks.
+
+6. **Resolve the SDK warning follow-up.** The tested Windows 10.0.18362 headers emit C5105.
+   Repeat the affected build with a newer Windows SDK compatible with the selected CUDA/MSVC
+   pair and record whether the warning remains. Do not suppress it without establishing its
+   cause. This diagnostic follow-up is separate from the passing storage correctness tests.
 
 ## Run
 
 `scripts\download-model.bat qwen38-27b` fetches the pinned official Qwen3.8-27B artifact and checks
 its size and SHA-256 (`qwen36-27b` and `qwen36-35b-a3b` work the same way), and
-`scripts\run.bat qwen38-27b` serves it with the measured profile; the profiles and their overrides
+`scripts\run.bat qwen38-27b` serves it on `127.0.0.1:8899` with the measured profile; the profiles and their overrides
 are in [launcher profiles](maintainer/launcher-profiles.md). Any other artifact starts with
 `ninfer-serve.exe` and the flags the [launch recipes](recipes.md) give for it, for example:
 
 ```powershell
 .\build-ninja\apps\ninfer-serve.exe models\qwen3_8_27b.ninfer --model-id qwen3.8-27b `
-  --max-context 131072 --kv-capacity 131072 --kv-dtype rk8v4 --gdn-state-fp16 `
+  --port 8899 --max-context 131072 --kv-capacity 131072 --kv-dtype rk8v4 --gdn-state-fp16 `
   --spec mtp --draft-tokens 3
 ```
 

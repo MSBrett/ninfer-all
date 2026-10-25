@@ -227,17 +227,7 @@ SpillTicket DiskKVBridge::try_submit(const DiskKVIdentity& id, DiskKVKind kind,
 
 bool DiskKVBridge::restore_page(const DiskKVIdentity& id, DiskKVKind kind,
                                 std::span<std::byte> destination) const {
-    const Family& target = family(kind);
-    const bool read      = target.store != nullptr && destination.size() == target.stride &&
-                           target.store->read_page(id, destination);
-    std::lock_guard lock(stats_mutex_);
-    if (read) {
-        ++stats_.restores;
-        stats_.restore_bytes += destination.size();
-    } else {
-        ++stats_.restore_misses;
-    }
-    return read;
+    return restore_pages(std::span<const DiskKVIdentity>(&id, 1), kind, destination);
 }
 
 bool DiskKVBridge::restore_pages_direct(const Family& target, std::span<const DiskKVIdentity> ids,
@@ -254,7 +244,13 @@ bool DiskKVBridge::restore_pages_direct(const Family& target, std::span<const Di
             .offset      = claim->offset,
             .destination = destination.subspan(index * target.stride, target.stride)});
     }
-    bool intact = claims.size() == ids.size() && direct_reader_->read(target.store->path(), reads);
+    bool intact = false;
+    try {
+        intact = claims.size() == ids.size() && target.store->read_direct(*direct_reader_, reads);
+    } catch (...) {
+        for (const auto& claim : claims) { target.store->release_read(claim, false); }
+        throw;
+    }
     for (std::size_t index = 0; index < claims.size(); ++index) {
         const bool page_intact =
             intact && target.store->claim_intact(claims[index], reads[index].destination);
@@ -267,7 +263,9 @@ bool DiskKVBridge::restore_pages_direct(const Family& target, std::span<const Di
 bool DiskKVBridge::restore_pages(std::span<const DiskKVIdentity> ids, DiskKVKind kind,
                                  std::span<std::byte> destination) const {
     const Family& target = family(kind);
-    if (target.store == nullptr || destination.size() != ids.size() * target.stride) {
+    if (target.store == nullptr || target.stride == 0 ||
+        destination.size() % target.stride != 0 ||
+        ids.size() != destination.size() / target.stride) {
         return false;
     }
     if (direct_reader_ != nullptr && !ids.empty() &&
@@ -275,7 +273,12 @@ bool DiskKVBridge::restore_pages(std::span<const DiskKVIdentity> ids, DiskKVKind
         std::lock_guard lock(stats_mutex_);
         stats_.restores += ids.size();
         stats_.restore_bytes += destination.size();
+        stats_.direct_storage_restores += ids.size();
         return true;
+    }
+    if (direct_reader_ != nullptr && !ids.empty()) {
+        std::lock_guard lock(stats_mutex_);
+        ++stats_.direct_storage_fallbacks;
     }
     constexpr std::size_t kReaders = 8;
     std::atomic<std::size_t> next{0};

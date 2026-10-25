@@ -2237,7 +2237,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--disk-kv-path DIR` | disk tier under the Host tier; see [Disk tier](#disk-tier) | off |
 | `--disk-kv-gib N` | disk tier budget in GiB | `64` |
 | `--disk-kv-restore` | seed a new request's matching prefix from the disk tier | write-only |
-| `--disk-kv-directstorage` | read restores through Microsoft DirectStorage; Windows builds with `-DNINFER_DIRECTSTORAGE=ON` only, untested | mapped reads |
+| `--disk-kv-directstorage` | read restores through Microsoft DirectStorage; Windows builds with `-DNINFER_DIRECTSTORAGE=ON` only | ordinary file reads |
 | `--context-cache-policy default\|rolling` | `rolling`: within one cache session (a Responses `prompt_cache_key`), a capture that extends a resident checkpoint the request matched exactly inherits that resident's demand, so a conversation whose prompt only grows keeps rolling its frontier forward; with conversations sharing a prefix, one conversation's extension can evict the prefix the others use | `default` |
 | `--concurrent-prefill` | admit waiting requests to free lanes while other requests prefill, instead of holding admission until the staged prefill finishes; without it a staged prefill whose last chunk can share a pass with others still admits them ([Execution behavior](#execution-behavior)) | off |
 | `--kv-lease-growth` | admission reserves the prompt plus a 4096-token output window (or `--prefill-chunk` when larger) instead of the whole `max_tokens` budget and extends it at decode-round boundaries, releasing idle retained cache owners least recently used first when the pool is short; an answer whose smallest step still does not fit ends with `finish_reason=length` before `max_tokens` | off |
@@ -2575,12 +2575,30 @@ restored. Without the flag the tier only writes. Writes of an evicted owner duri
 a batch at a time between decode rounds; an owner released elsewhere is written within 20 seconds,
 and shutdown writes for at most 60.
 
-On Windows, a build configured with `-DNINFER_DIRECTSTORAGE=ON` fetches the DirectStorage 1.3
-runtime and offers `--disk-kv-directstorage`: a restore then reads its pages into host memory
-through a DirectStorage queue, every page of a staging batch in flight at once, instead of copying
-from the mapped files. Each page is still checked against its CRC, and a batch that fails or does
-not complete within 10 seconds falls back to the mapped reads. This path has been checked to compile
-against Windows headers but has not been run.
+On Windows, a build configured with `-DNINFER_DIRECTSTORAGE=ON` fetches the pinned DirectStorage
+1.3.0 SDK/runtime and offers `--disk-kv-directstorage`. Restores read page batches into the
+existing host staging buffers through a persistent DirectStorage queue; this is a system-memory
+read path, followed by the engine's normal CUDA transfer. Pages retain their identity and CRC checks.
+The optional runtime DLLs are loaded only when the option is requested, from beside the
+module that contains the reader (the executable or the portable backend DLL).
+
+DirectStorage opens files read-only. Each batch pauses that store's payload I/O, releases its
+writable mapping and handles, reads the claimed pages, then restores the mapping before writers
+or ordinary reads resume. This adds handle and mapping work per batch; no inference throughput
+improvement has been established. Reads are split at 32 MiB and queue capacity boundaries. A
+failed batch falls back to ordinary reads. A batch deadline is 10 seconds; on timeout the queue
+is cancelled and closed before the caller may reuse its buffers. Closing may wait for issued
+I/O to settle, so the deadline is not a strict wall-clock bound.
+
+Windows host tests exercise real reads and byte-exact restores, including queue boundaries,
+concurrent writers, restart, CRC rejection and timeout cleanup; enabled and disabled builds pass.
+GPU inference with this option has not been qualified. The remaining product, inference,
+performance and CI work is tracked in [Remaining DirectStorage work](build-windows.md#remaining-directstorage-work).
+SDK behavior follows Microsoft's
+[Developer Guidance](https://github.com/microsoft/DirectStorage/blob/main/Docs/DeveloperGuidance.md),
+[OpenFile](https://learn.microsoft.com/en-us/windows/win32/dstorage/dstorage/nf-dstorage-idstoragefactory-openfile)
+and [queue Close](https://learn.microsoft.com/en-us/windows/win32/dstorage/dstorage/nf-dstorage-idstoragequeue-close)
+contracts.
 
 ## Execution behavior
 

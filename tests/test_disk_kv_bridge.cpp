@@ -7,6 +7,7 @@
 #include <cstring>
 #include <exception>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <random>
 #include <string>
@@ -136,6 +137,83 @@ int main() {
                   "a dropped page is gone");
             const auto stats = bridge.stats();
             check(stats.restores == 2, "restore statistics count");
+        }
+        if (ninfer::DirectStorageReader::available_in_build()) {
+            const auto direct_root = root / "direct";
+            auto direct = options(direct_root);
+            direct.direct_storage = true;
+            {
+                DiskKVBridge bridge(direct);
+                check(bridge.spill_page_sync(id(21, 64), DiskKVKind::MainKV, main_page) &&
+                          bridge.spill_page_sync(id(22, 128), DiskKVKind::MainKV, tail_page) &&
+                          bridge.spill_page_sync(id(23, 128), DiskKVKind::StateImage, state_page),
+                      "DirectStorage fixtures spill through the normal cache writer");
+                std::vector<std::byte> out(kMain), pair(2 * kMain), state(kState);
+                check(bridge.restore_page(id(21, 64), DiskKVKind::MainKV, out) && out == main_page,
+                      "a single page restores through DirectStorage exactly");
+                check(bridge.restore_pages(std::vector<DiskKVIdentity>{id(22, 128), id(21, 64)},
+                                           DiskKVKind::MainKV, pair) &&
+                          std::equal(tail_page.begin(), tail_page.end(), pair.begin()) &&
+                          std::equal(main_page.begin(), main_page.end(), pair.begin() + kMain),
+                      "DirectStorage restores multiple pages in requested order");
+                check(bridge.restore_page(id(23, 128), DiskKVKind::StateImage, state) &&
+                          state == state_page,
+                      "state images also restore through DirectStorage exactly");
+                const auto stats = bridge.stats();
+                check(stats.direct_storage_restores == 4 && stats.direct_storage_fallbacks == 0,
+                      "successful bridge tests used DirectStorage without ordinary fallback");
+                std::atomic<bool> writers_ok{true};
+                std::vector<std::thread> writers;
+                for (std::uint32_t writer = 0; writer < 3; ++writer) {
+                    writers.emplace_back([&, writer] {
+                        for (std::uint32_t n = 0; n < 16; ++n) {
+                            if (!bridge.spill_page_sync(id(1000 + writer * 16 + n, 256),
+                                                         DiskKVKind::MainKV, tail_page)) {
+                                writers_ok.store(false);
+                            }
+                        }
+                    });
+                }
+                bool reads_ok = true;
+                for (int n = 0; n < 16; ++n) {
+                    reads_ok = bridge.restore_page(id(21, 64), DiskKVKind::MainKV, out) &&
+                               out == main_page && reads_ok;
+                }
+                for (auto& writer : writers) { writer.join(); }
+                check(reads_ok && writers_ok.load() && bridge.stats().direct_storage_fallbacks == 0,
+                      "DirectStorage restores coexist with active cache writers");
+                check(!bridge.restore_pages(
+                          std::vector<DiskKVIdentity>{id(21, 64), id(99, 192)},
+                          DiskKVKind::MainKV, pair),
+                      "a missing DirectStorage page fails after ordinary fallback");
+                check(bridge.restore_page(id(21, 64), DiskKVKind::MainKV, out) && out == main_page,
+                      "a partial missing batch releases its earlier page claims");
+                check(!bridge.restore_pages(std::vector<DiskKVIdentity>{id(21, 64)},
+                                             DiskKVKind::MainKV, pair),
+                      "a mismatched destination size is refused");
+            }
+            {
+                DiskKVBridge bridge(direct);
+                std::vector<std::byte> out(kMain);
+                check(bridge.restore_page(id(21, 64), DiskKVKind::MainKV, out) && out == main_page &&
+                          bridge.stats().direct_storage_restores == 1,
+                      "DirectStorage restores persisted pages after reopening");
+                // Slot zero contains the first main page. Change payload bytes, leaving its
+                // stored CRC intact, exactly as a torn/corrupt cache page would appear.
+                {
+                    std::fstream corrupt(direct_root / "diskkv_main",
+                                          std::ios::in | std::ios::out | std::ios::binary);
+                    corrupt.seekp(ninfer::DiskKVStore::kSlotHeaderSize);
+                    const char byte = static_cast<char>(std::to_integer<unsigned char>(main_page[0]) ^ 1U);
+                    corrupt.write(&byte, 1);
+                    if (!corrupt) { throw std::runtime_error("cannot corrupt the DirectStorage fixture"); }
+                }
+                check(!bridge.restore_page(id(21, 64), DiskKVKind::MainKV, out),
+                      "a corrupt DirectStorage payload fails CRC and ordinary fallback");
+                check(bridge.stats().direct_storage_fallbacks == 1 &&
+                          bridge.drop_page(id(21, 64), DiskKVKind::MainKV),
+                      "CRC failure is counted and releases the page claim");
+            }
         }
         if (!ninfer::DirectStorageReader::available_in_build()) {
             DiskKVBridge::Options direct = options(root);

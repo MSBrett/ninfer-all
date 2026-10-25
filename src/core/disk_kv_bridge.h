@@ -52,6 +52,8 @@ struct DiskKVBridgeStats {
     std::uint64_t restore_misses = 0;
     std::uint64_t evicted_pages  = 0;
     std::uint64_t queue_drops    = 0;
+    std::uint64_t direct_storage_restores = 0; // pages whose DirectStorage read and CRC succeeded
+    std::uint64_t direct_storage_fallbacks = 0; // batches retried through ordinary file reads
 };
 
 class DiskKVBridge {
@@ -65,7 +67,7 @@ public:
         std::size_t capacity_bytes = 0;
         bool verify_crc            = true;
         // Restore consecutive pages through DirectStorage (Windows builds with
-        // NINFER_DIRECTSTORAGE); a failed batch falls back to mapped reads.
+        // NINFER_DIRECTSTORAGE); a failed batch falls back to ordinary file reads.
         bool direct_storage = false;
     };
 
@@ -153,7 +155,7 @@ private:
     // Index publication is batched: slots are self-describing and a lost index is rebuilt.
     static constexpr std::uint32_t kFlushInterval = 64;
 
-    // Reads a batch through DirectStorage; false leaves the caller to the mapped path.
+    // Reads a batch through DirectStorage; false leaves the caller to ordinary file reads.
     [[nodiscard]] bool restore_pages_direct(const Family& target,
                                             std::span<const DiskKVIdentity> ids,
                                             std::span<std::byte> destination) const;

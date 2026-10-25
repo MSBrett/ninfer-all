@@ -72,9 +72,12 @@ endfunction()
 # before main (0xC0000135). Stage the full closure next to each binary so it runs
 # standalone.
 
-# Collect the FFMPEG + libcurl runtime DLLs from the vcpkg bin tree into <out_var>.
+# Collect optional backend DLLs and the FFmpeg/libcurl runtime closure into <out_var>.
 function(ninfer_runtime_dll_list out_var)
   set(_list "")
+  if(WIN32 AND NINFER_DIRECTSTORAGE)
+    list(APPEND _list ${NINFER_DIRECTSTORAGE_DLLS})
+  endif()
   if(WIN32 AND NINFER_WINDOWS_KERNEL_DLL AND TARGET ninfer_ggml_quants_dll)
     list(APPEND _list "$<TARGET_FILE:ninfer_ggml_quants_dll>")
   endif()
@@ -103,7 +106,7 @@ function(ninfer_stage_runtime_dlls target)
   add_custom_command(TARGET ${target} POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
       ${_ninfer_rt_dlls} $<TARGET_FILE_DIR:${target}>
-    COMMENT "Staging runtime DLLs (ffmpeg/curl) next to ${target}")
+    COMMENT "Staging runtime DLLs (backend/ffmpeg/curl) next to ${target}")
 endfunction()
 
 # Stage the shared FFMPEG/curl closure once next to the test executables. All test
@@ -121,5 +124,5 @@ function(ninfer_stage_test_runtime_dlls anchor_target)
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             ${_ninfer_test_rt_dlls}
             "$<TARGET_FILE_DIR:${anchor_target}>"
-    COMMENT "Staging runtime DLLs (ffmpeg/curl) next to test executables")
+    COMMENT "Staging runtime DLLs (backend/ffmpeg/curl) next to test executables")
 endfunction()

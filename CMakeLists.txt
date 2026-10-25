@@ -168,25 +168,26 @@ if(NINFER_BF16_RESIDUAL_ADD)
   add_compile_definitions(NINFER_BF16_RESIDUAL_ADD=1)
 endif()
 # Windows only: disk-tier restores through Microsoft DirectStorage, for --disk-kv-directstorage.
-# dstorage.dll is delay-loaded, so a binary that never asks for DirectStorage runs without it.
+# The runtime is loaded only when requested; every executable can start without the SDK DLLs.
 option(NINFER_DIRECTSTORAGE
        "On Windows, offer --disk-kv-directstorage: disk-tier restores through DirectStorage" OFF)
 if(WIN32 AND NINFER_DIRECTSTORAGE)
   include(FetchContent)
   FetchContent_Declare(directstorage
     URL "https://www.nuget.org/api/v2/package/Microsoft.Direct3D.DirectStorage/1.3.0"
-    DOWNLOAD_NAME "directstorage.1.3.0.zip")
+    DOWNLOAD_NAME "directstorage.1.3.0.zip"
+    URL_HASH SHA256=8ab6c1082537565388b79050d94fdd7f5f437cd0f1d909e7b19f786042b97177)
   FetchContent_MakeAvailable(directstorage)
   add_library(ninfer_directstorage INTERFACE)
   target_include_directories(ninfer_directstorage INTERFACE
     "${directstorage_SOURCE_DIR}/native/include")
-  target_link_libraries(ninfer_directstorage INTERFACE
-    "${directstorage_SOURCE_DIR}/native/lib/x64/dstorage.lib" delayimp)
-  target_link_options(ninfer_directstorage INTERFACE "/DELAYLOAD:dstorage.dll")
+  # The reader loads the optional runtime explicitly; no startup import or delay-load hook.
+  target_compile_definitions(ninfer_directstorage INTERFACE NINFER_DIRECTSTORAGE=1)
   set(NINFER_DIRECTSTORAGE_DLLS
     "${directstorage_SOURCE_DIR}/native/bin/x64/dstorage.dll"
     "${directstorage_SOURCE_DIR}/native/bin/x64/dstoragecore.dll")
-  add_compile_definitions(NINFER_DIRECTSTORAGE=1)
+  set(NINFER_DIRECTSTORAGE_LICENSE "${directstorage_SOURCE_DIR}/LICENSE.txt"
+      CACHE INTERNAL "DirectStorage redistributable license" FORCE)
 endif()
 # The largest attention units end a build on one single-threaded ptxas. --split-compile lets nvcc
 # optimize one unit on several threads; 0 means every core, which a parallel ninja multiplies by its

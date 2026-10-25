@@ -60,8 +60,8 @@ class Config:
 class Tail:
     """Incrementally tail a file, surviving rotation (rename) and truncation.
 
-    On first open it seeks to the end (no backfill). Each read_lines() call returns the complete
-    lines appended since the last call. If the file's inode changes (renamed away) or its size
+    On first open it reads existing records so a monitor reload preserves request metrics.
+    Each read_lines() call returns the complete lines appended since the last call. If the file's inode changes (renamed away) or its size
     shrinks below our position (truncated), it reopens at the start of the new file.
     """
 
@@ -71,7 +71,7 @@ class Tail:
         self.ino = None
         self.pos = 0
         self.buf = ""
-        self._open(at_end=True)
+        self._open(at_end=False)
 
     def _open(self, at_end: bool) -> None:
         try:
@@ -122,6 +122,8 @@ def flatten_stats(stats: dict, memory: dict) -> dict:
     pressure = cache.get("pressure", {})
     cache_occupancy = cache.get("occupancy", {})
     selections = cache.get("selections", {})
+    hybrid = cache.get("hybrid", {})
+    hybrid_host_capacity = hybrid.get("host_capacity_bytes", 0)
 
     def transfers(block: str, unit: str) -> dict:
         out = {}
@@ -142,8 +144,11 @@ def flatten_stats(stats: dict, memory: dict) -> dict:
         "counters": stats.get("counters", {}),
         "memory": {
             "kv_capacity_page_groups": capacity.get("kv_capacity_pages", 0),
-            "host_kv_capacity_bytes": capacity.get("host_kv_bytes", 0),
-            "host_kv_occupied_bytes": occupancy.get("host_kv_bytes", 0),
+            "host_cache_kind": "hybrid" if hybrid_host_capacity else "legacy",
+            "host_cache_capacity_bytes": hybrid_host_capacity or capacity.get("host_kv_bytes", 0),
+            "host_cache_occupied_bytes": (hybrid.get("host_used_bytes", 0)
+                                          if hybrid_host_capacity
+                                          else occupancy.get("host_kv_bytes", 0)),
             "host_state_capacity_slots": capacity.get("host_state_slots", 0),
             "host_state_occupied_slots": occupancy.get("host_state_slots", 0),
             "kv_payload_bytes": memory.get("kv_payload_bytes"),
@@ -194,8 +199,7 @@ class Monitor:
         self._lock = threading.Lock()
 
     def bootstrap_server_info(self) -> None:
-        # The request-log tail starts at the end, so the server_start record written before this
-        # sidecar started is found by one scan of the current file.
+        # Seed metadata before the sampler replays the existing request log.
         if not self.cfg.jsonl:
             return
         try:
@@ -213,6 +217,7 @@ class Monitor:
         self.server_info["instance_id"] = rec.get("server_instance_id")
         self.server_info["model"] = rec.get("server", {}).get("public_model_id")
         self.server_info["memory"] = rec.get("memory", {})
+        self.spec_backend = rec.get("engine", {}).get("speculative_backend")
 
     # -- request log --------------------------------------------------------
 
@@ -692,7 +697,7 @@ td.msg{white-space:normal;max-width:420px;color:var(--muted)}
       <canvas id="c-decode"></canvas><div class="legend" id="l-decode"></div></div>
     <div class="card"><h2>Prefill throughput (tok/s)</h2>
       <canvas id="c-prefill"></canvas><div class="legend" id="l-prefill"></div></div>
-    <div class="card"><h2>Host KV usage</h2>
+    <div class="card"><h2>Host cache usage</h2>
       <canvas id="c-kv"></canvas><div class="legend" id="l-kv"></div></div>
     <div class="card"><h2>Device KV occupancy</h2>
       <canvas id="c-devkv"></canvas><div class="legend" id="l-devkv"></div></div>
@@ -970,7 +975,7 @@ function render(d){
     crBar+
     '<div style="font-size:12px;color:var(--muted);margin-top:6px">reused prompt tokens: '+rpt.toLocaleString()+'</div>';
   draw('c-kv','l-kv',[
-    seriesFrom(S,s=>{const m=s.stats?.memory;return m&&m.host_kv_capacity_bytes?m.host_kv_occupied_bytes/m.host_kv_capacity_bytes*100:null;},C.kv[2],'host KV used %'),
+    seriesFrom(S,s=>{const m=s.stats?.memory;return m&&m.host_cache_capacity_bytes?m.host_cache_occupied_bytes/m.host_cache_capacity_bytes*100:null;},C.kv[2],'host cache used %'),
   ]);
   draw('c-mtp','l-mtp',[
     seriesFrom(S,s=>s.rolling?.mtp_accept_rate!=null?s.rolling.mtp_accept_rate*100:null,C.mtp[0],'accept %'),
@@ -1018,12 +1023,13 @@ function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>
 function timeCell(ms){return ms?'<td title="'+fmtAgo(ms)+'">'+fmtT(ms)+'</td>':'<td>–</td>';}
 function renderKvBars(latest){
   const mem=latest.stats?.memory||{};
-  const gb=v=>(v/1073741824).toFixed(1)+' GB';
+  const gb=v=>(v/1073741824).toFixed(2)+' GiB';
   const pstats=latest.stats?.pressure||{};
   const pg=pstats.device_main_kv_occupied_pages||0;const bpg=pstats.device_backend_kv_occupied_pages||0;
   const mpg=mem.kv_capacity_page_groups||0;
   const pgPct=mpg?pg/mpg*100:0,bpgPct=mpg?bpg/mpg*100:0;
-  const budget=mem.host_kv_capacity_bytes||0,used=mem.host_kv_occupied_bytes||0;
+  const budget=mem.host_cache_capacity_bytes||0,used=mem.host_cache_occupied_bytes||0;
+  const hybrid=mem.host_cache_kind==='hybrid';
   const usedPct=budget?used/budget*100:0;
   const slots=mem.host_state_occupied_slots||0,maxSlots=mem.host_state_capacity_slots||0;
   const devSlots=pstats.device_state_occupied_slots||0;
@@ -1032,11 +1038,11 @@ function renderKvBars(latest){
   const spill=pstats.spill_pages||0,ckptDrop=pstats.checkpoints_dropped||0;
   let h='<div style="font-size:12px;color:var(--muted);margin-bottom:4px">device KV: '+pg+' / '+mpg+' pages ('+pgPct.toFixed(0)+'%)'+(mem.kv_payload_bytes?' · payload: '+gb(mem.kv_payload_bytes):'')+'</div>';
   h+=bar([{pct:pgPct,color:C.kv[0],label:'used'},{pct:100-pgPct,color:'#30363d',label:'free'}]);
-  h+='<div style="font-size:12px;color:var(--muted);margin:8px 0 4px">host KV: '+gb(used)+' / '+gb(budget)+' ('+usedPct.toFixed(0)+'%) · state slots '+slots+'/'+maxSlots+' · device state '+devSlots+'</div>';
+  h+='<div style="font-size:12px;color:var(--muted);margin:8px 0 4px">'+(hybrid?'hybrid host cache: ':'host KV: ')+gb(used)+' / '+gb(budget)+' ('+usedPct.toFixed(1)+'%)'+(hybrid?' · KV blocks + state snapshots':' · state slots '+slots+'/'+maxSlots)+' · device state '+devSlots+'</div>';
   if(budget>0){
     h+=bar([{pct:usedPct,color:C.kv[2],label:'used'},{pct:100-usedPct,color:'#30363d',label:'free'}]);
   } else {
-    h+='<div class="empty">host KV cache disabled</div>';
+    h+='<div class="empty">host cache disabled</div>';
   }
   h+='<div style="font-size:12px;color:var(--muted);margin:6px 0 2px">pressure (cum): evict '+evict+' · demote '+demoted+' · spill '+spill+' · ckpt_drop '+ckptDrop+'</div>';
   $('kvbars').innerHTML=h;

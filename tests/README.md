@@ -32,7 +32,9 @@ added up to tens of GB. Each test keeps its name as a program in the bundle and 
 own process under CTest. Run one by hand with `build/tests/ninfer_tests <name> [args...]`;
 `ninfer_tests --list` prints the names. `ninfer_jinja_test` and
 `ninfer_artifact_materialization_test` stay standalone because Python tests invoke them by path.
-A test's helpers and entry function must be internal (anonymous namespace) so that programs do not
+The host-only `ninfer_disk_kv_store_test`, `ninfer_disk_kv_bridge_test` and
+`ninfer_directstorage_test` are also standalone and link only the Core disk-storage target.
+They need no CUDA device or kernel image. A test's helpers and entry function must be internal (anonymous namespace) so that programs do not
 collide at link time. The mechanism is `cmake/NinferBundles.cmake`.
 `ops/op_tester.h` and `ops/op_check.h` own only reusable device/guard and comparison mechanics.
 Concrete numerical criteria remain named by the semantic Op suite; there are no cross-Op tolerance
@@ -60,6 +62,23 @@ On a machine without a usable CUDA device -- no GPU, an old driver, or only the 
 `$CUDA_HOME/lib64/stubs/libcuda.so`, as CI does) -- every test that needs a device reports as
 skipped and the host tests still run. A test asks `tests/cuda_availability.h`; one that fails on its
 first CUDA call with the runtime's no-device message is skipped by CTest the same way.
+
+To qualify the Windows DirectStorage path, configure the usual Windows build with
+`-DNINFER_DIRECTSTORAGE=ON`, then build and run the host storage targets:
+
+```powershell
+cmake --build build-windows -j --target ninfer_directstorage_test ninfer_disk_kv_store_test ninfer_disk_kv_bridge_test
+ctest --test-dir build-windows --output-on-failure -R "^ninfer_(directstorage(_backend)?|disk_kv_store|disk_kv_bridge)_test$"
+```
+
+Repeat with `-DNINFER_DIRECTSTORAGE=OFF` in another build directory to check explicit refusal
+and the normal file-I/O path. The enabled reader test uses the real SDK: it checks ranges over
+32 MiB, more requests than queue capacity, UTF-8 paths, invalid ranges, concurrent callers,
+timeout buffer lifetime and startup without loading the optional DLLs. The enabled backend
+probe loads the reader as a shared library with the SDK only beside that library, matching the
+portable archive layout and excluding developer search paths. The bridge test verifies
+that successful reads used DirectStorage, then checks concurrent writes, restart, CRC rejection
+and fallback. These are host tests, not GPU inference or performance qualification.
 
 `scripts/check-host-compile.py BUILD_DIR...` compiles the host code of every translation unit of
 configured builds (`-DCMAKE_EXPORT_COMPILE_COMMANDS=ON`) for syntax only, without device code: each

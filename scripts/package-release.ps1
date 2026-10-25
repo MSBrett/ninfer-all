@@ -36,6 +36,12 @@ $Suffix = if ($SourceState.Count) { '-dirty' } else { '' }
 $ProductName = "ninfer-windows-x64-cuda$CudaVersion-sm$($Archs -join '-')-$($Revision.Substring(0,12))$Suffix"
 $DistRoot = Join-Path $RepoRoot 'dist'
 $ProductRoot = Join-Path $DistRoot $ProductName
+# Resolve the exact replacement target before any recursive deletion.
+$ResolvedDistRoot = [IO.Path]::GetFullPath($DistRoot).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+$ProductRoot = [IO.Path]::GetFullPath($ProductRoot)
+if (-not $ProductRoot.StartsWith($ResolvedDistRoot, [StringComparison]::OrdinalIgnoreCase)) {
+    throw 'Package replacement target is outside dist'
+}
 $ChecksumPath = Join-Path $DistRoot "SHA256SUMS-$ProductName.txt"
 $ArchivePath = Join-Path $DistRoot "$ProductName.7z"
 $SevenZip = (Get-Command 7z -ErrorAction Stop).Source
@@ -84,6 +90,18 @@ foreach ($name in "cublas64_$CudaMajor.dll", "cublasLt64_$CudaMajor.dll") {
     Copy-Item -LiteralPath $found[0] -Destination $BackendRoot
 }
 Copy-Item -LiteralPath $Eula -Destination (Join-Path $BackendRoot 'NVIDIA-CUDA-EULA.txt')
+if ((Read-Cache 'NINFER_DIRECTSTORAGE') -eq 'ON') {
+    foreach ($name in 'dstorage.dll', 'dstoragecore.dll') {
+        if (-not (Test-Path -LiteralPath (Join-Path $BackendRoot $name))) {
+            throw "Missing DirectStorage runtime: $name"
+        }
+    }
+    $DirectStorageLicense = Read-Cache 'NINFER_DIRECTSTORAGE_LICENSE'
+    if (-not (Test-Path -LiteralPath $DirectStorageLicense)) {
+        throw 'Missing DirectStorage redistributable license'
+    }
+    Copy-Item -LiteralPath $DirectStorageLicense -Destination (Join-Path $BackendRoot 'DirectStorage-LICENSE.txt')
+}
 foreach ($file in 'VERSION', 'LICENSE') { Copy-Item -LiteralPath (Join-Path $RepoRoot $file) -Destination $ProductRoot }
 if (Test-Path -LiteralPath $ReleaseNotes) {
     Copy-Item -LiteralPath $ReleaseNotes -Destination $ProductRoot
@@ -147,6 +165,7 @@ foreach ($product in $Products) {
    cuda = $CudaVersion; cuda_compiler = $CudaVersionText; architectures = $Archs; platform = 'windows-x64';
    cuda_archive_ptx_pruned = ((Read-Cache 'NINFER_CUDA_PRUNE_PTX') -eq 'ON');
    ggml_kernel_dll = $KernelDll; layout = 'shared-runtime-v1'; commands = $Commands;
+   directstorage = ((Read-Cache 'NINFER_DIRECTSTORAGE') -eq 'ON');
    validation = 'Device images present; all launchers passed --help without Toolkit on PATH. GPU inference was not tested.'
 } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $ProductRoot 'BUILD-INFO.json') -Encoding utf8
 $innerHashes = Get-ChildItem -LiteralPath $ProductRoot -File -Recurse | Sort-Object FullName | ForEach-Object {

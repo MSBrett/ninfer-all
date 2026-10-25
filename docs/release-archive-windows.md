@@ -51,7 +51,7 @@ From the directory you unpacked, two commands (or double-click either file and p
 
 ```powershell
 .\download-model.bat qwen38-27b        # ~19 GB, resumable, verifies size and SHA256; the DFlash2 bundle, it also carries the MTP weights
-.\run.bat qwen38-27b                   # serves on http://127.0.0.1:8080/v1
+.\run.bat qwen38-27b                   # serves on http://127.0.0.1:8899/v1
 ```
 
 The downloader writes into `models\` beside these files, which is where the launcher looks.
