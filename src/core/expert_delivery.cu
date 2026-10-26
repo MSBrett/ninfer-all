@@ -38,6 +38,8 @@ constexpr std::uint32_t kCountMask = (1u << 30) - 1;
 constexpr std::uint32_t kCpuCall = 1;
 constexpr std::uint32_t kHit     = 1u << 30;
 constexpr std::uint32_t kMiss    = 1u << 31;
+// The split's shared count of an expert whose table entry hits.
+constexpr std::uint32_t kInCache = 1u << 31;
 
 std::uint64_t aligned(std::uint64_t n) {
     if (n > std::numeric_limits<std::uint64_t>::max() - 255) {
@@ -110,11 +112,13 @@ struct Storage {
     }
 };
 
-// Device ranges a call hands the host service (the CPU's operands), into mapped host memory.
+// Device ranges a call hands the host service (the CPU's operands), into mapped host memory: the
+// pairs' expert ids, then up to kCpuInputs inputs of the family's.
+constexpr int kCpuInputs = 3;
 struct HostCopies {
-    const std::byte* source[3]{};
-    std::byte* target[3]{};
-    std::uint32_t bytes[3]{};
+    const std::byte* source[1 + kCpuInputs]{};
+    std::byte* target[1 + kCpuInputs]{};
+    std::uint32_t bytes[1 + kCpuInputs]{};
 };
 
 // One block: a shared histogram of the call's experts, then each pair's cached/missing id and each
@@ -156,14 +160,8 @@ __global__ void split_routes(const std::int32_t* ids, std::uint32_t pairs, int e
         return !wide && ((address >= lent_low[0] && address < lent_high[0]) ||
                          (address >= lent_low[1] && address < lent_high[1]));
     };
-    for (std::uint32_t p = threadIdx.x; p < pairs; p += blockDim.x) {
-        const int e       = ids[p];
-        const bool valid  = e >= 0 && e < experts;
-        const bool cached_pair = valid && hit(tables[e]);
-        cached[p]  = cached_pair ? e : -1;
-        missing[p] = valid && !cached_pair ? e : -1;
-    }
     // Each warp ballots its experts of a block-wide pass; earlier warps and passes place them.
+    // A routed expert's count keeps its hit in the top bit for the pairs below.
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     for (int first = 0; first < experts; first += blockDim.x) {
         const int e               = first + threadIdx.x;
@@ -173,6 +171,7 @@ __global__ void split_routes(const std::int32_t* ids, std::uint32_t pairs, int e
         const unsigned misses     = __ballot_sync(~0u, count != 0 && !in_cache);
         if (e < experts) {
             needed[e] = count == 0 ? 0u : (count & kCountMask) | (in_cache ? kHit : kMiss);
+            if (in_cache) { counts[e] = count | kInCache; }
         }
         if (lane == 0) {
             sets[0][warp] = __popc(hits);
@@ -201,9 +200,32 @@ __global__ void split_routes(const std::int32_t* ids, std::uint32_t pairs, int e
         }
         __syncthreads();
     }
-    for (int c = 0; c < 3; ++c) {
-        for (std::uint32_t i = threadIdx.x; i < copies.bytes[c]; i += blockDim.x) {
-            copies.target[c][i] = copies.source[c][i];
+    for (std::uint32_t p = threadIdx.x; p < pairs; p += blockDim.x) {
+        const int e            = ids[p];
+        const bool valid       = e >= 0 && e < experts;
+        const bool cached_pair = valid && (counts[e] & kInCache) != 0;
+        cached[p]  = cached_pair ? e : -1;
+        missing[p] = valid && !cached_pair ? e : -1;
+    }
+    // 16-byte words where both ends and the length allow, else 4-byte words or bytes: a warp's
+    // writes into mapped memory cross the bus as fewer, wider writes.
+    for (int c = 0; c < 1 + kCpuInputs; ++c) {
+        const std::byte* source = copies.source[c];
+        std::byte* target       = copies.target[c];
+        const std::uint32_t n   = copies.bytes[c];
+        const auto ends = reinterpret_cast<std::uintptr_t>(source) |
+                          reinterpret_cast<std::uintptr_t>(target) | n;
+        if ((ends & 15) == 0) {
+            for (std::uint32_t i = threadIdx.x; i < n / 16; i += blockDim.x) {
+                reinterpret_cast<uint4*>(target)[i] = reinterpret_cast<const uint4*>(source)[i];
+            }
+        } else if ((ends & 3) == 0) {
+            for (std::uint32_t i = threadIdx.x; i < n / 4; i += blockDim.x) {
+                reinterpret_cast<std::uint32_t*>(target)[i] =
+                    reinterpret_cast<const std::uint32_t*>(source)[i];
+            }
+        } else {
+            for (std::uint32_t i = threadIdx.x; i < n; i += blockDim.x) { target[i] = source[i]; }
         }
     }
     // The host reads the mask and the copies once it sees the request.
@@ -235,8 +257,8 @@ struct ExpertDelivery::Impl {
         // Bank stride of each blob: the blob's bytes when every expert's are equal (the resident
         // layout, one copy per run of experts), else its aligned maximum.
         std::vector<std::uint64_t> stride;
+        // The other layer whose wide call followed this layer's last wide call (-1: none yet).
         std::int64_t successor = -1;
-        bool successor_wide    = false;
         std::vector<std::uint64_t> total; // the narrow calls' routes of each expert
         bool cpu = false;                 // the family computes its experts on the CPU
         // Where each expert's entries point besides a cache slot: the lent slot holding it, and
@@ -375,6 +397,7 @@ struct ExpertDelivery::Impl {
     // next split, then that call's cached pairs), so post work writes only free slots. Cached
     // experts are replaced only while a request is served, never one it routes.
     std::int64_t previous_layer = -1;
+    bool previous_wide          = false;
     std::size_t call_layer      = 0;
     int call_bank               = 0;
     bool call_wide              = false;
@@ -1189,9 +1212,17 @@ struct ExpertDelivery::Impl {
 
     // Promotions of an earlier wide call (their copies precede the next table upload on
     // `copies`) and round candidates whose copies have landed: their entries move to their slots.
-    void land() {
+    // With `keep_hits`, an expert the served narrow call routes from a lent slot stays there until
+    // a later call: the call's cached pairs may still be reading that slot, which a miss of the
+    // call would otherwise take once its expert left.
+    void land(bool keep_hits = false) {
         std::vector<cudaEvent_t> done;
         for (auto it = deferred.begin(); it != deferred.end();) {
+            if (keep_hits && it->layer == call_layer && call_routed[std::size_t(it->expert)] &&
+                layers[it->layer].lent_of[std::size_t(it->expert)] >= 0) {
+                ++it;
+                continue;
+            }
             if (it->landed) {
                 const cudaError_t status = cudaEventQuery(it->landed);
                 if (status == cudaErrorNotReady) {
@@ -1406,9 +1437,10 @@ struct ExpertDelivery::Impl {
         return bytes / 1e6;
     }
 
-    // The CPU's products of `cpu` for the served call of `pairs` pairs while this thread issues
-    // the call's copies (`issue`; before a disk expert's reads, which they would wait behind),
-    // then its missing ids without the CPU's pairs, its products and flag for the device.
+    // The CPU's products of `cpu` for the served call of `pairs` pairs after this thread issues
+    // the call's copies (`issue`): the products' setup (the activation's repacking, the jobs'
+    // buffers) and a disk expert's reads would otherwise delay every copy of the call. Then its
+    // missing ids without the CPU's pairs, its products and flag for the device.
     void compute_cpu(std::size_t li, const std::vector<std::int32_t>& cpu, std::uint32_t pairs,
                      const std::uint32_t* needed, ExpertDeliveryStats& delta,
                      const std::function<void()>& issue) {
@@ -1447,10 +1479,8 @@ struct ExpertDelivery::Impl {
                 }
             }
         }
-        if (!reads.empty()) {
-            issue();
-            read_now(reads);
-        }
+        issue();
+        if (!reads.empty()) { read_now(reads); }
         const auto* ids = static_cast<const std::int32_t*>(host_ids->data());
         ExpertCpuProducts::Work work;
         work.layer    = li;
@@ -1460,7 +1490,6 @@ struct ExpertDelivery::Impl {
         work.inputs   = static_cast<const std::byte*>(host_inputs->data());
         work.products = static_cast<std::byte*>(host_products->data());
         work.pool     = pool.get();
-        if (reads.empty()) { work.side = issue; }
         const auto [used, microseconds] = options.cpu.products->compute(work);
         if (used > options.cpu.product_bytes) {
             throw std::logic_error("expert delivery: CPU products exceed their buffer");
@@ -1501,7 +1530,6 @@ struct ExpertDelivery::Impl {
     void serve(const CudaHostHandshake::Request& request) {
         const auto started = std::chrono::steady_clock::now();
         ExpertDeliveryStats delta;
-        land();
         const std::size_t li = request.tag;
         auto& layer = layers.at(li);
         call_layer = li;
@@ -1525,16 +1553,19 @@ struct ExpertDelivery::Impl {
         }
         delta.routes = routes;
         const bool wide = 2 * routes >= std::uint32_t(experts);
+        land(!wide);
         ++stamp;
         for (int e = 0; e < experts; ++e) {
             const auto l = layer.lent_of[std::size_t(e)];
             if (call_routed[std::size_t(e)] && l >= 0) { lent_slots[std::size_t(l)].used = stamp; }
         }
-        if (previous_layer >= 0) {
+        // Only wide calls in a row to two layers set a successor: the narrow calls between prompts
+        // and a prompt span's repeated calls to one layer leave the order of its passes.
+        if (wide && previous_wide && previous_layer >= 0 && previous_layer != std::int64_t(li)) {
             layers[std::size_t(previous_layer)].successor = std::int64_t(li);
-            layers[std::size_t(previous_layer)].successor_wide = wide;
         }
         previous_layer = std::int64_t(li);
+        previous_wide  = wide;
         const bool new_pass = !wide && last_narrow >= 0 && std::int64_t(li) < last_narrow;
         if (wide) { quiet_passes = 0; }
         if (per_bank && new_pass && ++quiet_passes >= 2) {
@@ -1696,7 +1727,7 @@ struct ExpertDelivery::Impl {
                 deferred.push_back({li, e, s});
             }
         }
-        if (bank_state.size() == 2 && layer.successor >= 0 && layer.successor_wide) {
+        if (bank_state.size() == 2 && layer.successor >= 0) {
             const auto next = std::size_t(layer.successor);
             const bool held = std::any_of(bank_state.begin(), bank_state.end(),
                                           [&](const Bank& b) { return b.layer == std::int64_t(next); });
@@ -1940,8 +1971,8 @@ ExpertDelivery::Call ExpertDelivery::begin(std::size_t index, const std::int32_t
     HostCopies copies;
     if (cpu) {
         // The CPU's operands: the pairs' experts and the family's inputs.
-        if (inputs.size() > 2) {
-            throw std::invalid_argument("expert delivery: more than two CPU inputs");
+        if (inputs.size() > std::size_t(kCpuInputs)) {
+            throw std::invalid_argument("expert delivery: more than three CPU inputs");
         }
         copies.source[0] = reinterpret_cast<const std::byte*>(ids);
         copies.target[0] = static_cast<std::byte*>(p.host_ids_mapped);
@@ -2028,6 +2059,7 @@ void ExpertDelivery::invalidate() {
     }
     p.set_free();
     p.previous_layer = -1;
+    p.previous_wide  = false;
     p.last_narrow = -1;
     if (p.host_flag) {
         *static_cast<std::int32_t*>(p.host_flag->data()) = 0;

@@ -45,10 +45,10 @@ int qualify() {
             ops::detail::nvfp4_ada_route_key(ops::detail::Nvfp4AdaOp::Linear,n,k),"a8");
         failures += run_shape("NVFP4_A8", ActivationCompute::A8, make_nvfp4_weight,
             {n, k, seed++, Comparison::SampledRows, true, calls,
-             ActivationSigns::Centered, true});
+             ActivationSigns::Centered, DType::BF16, true});
         failures += run_shape("NVFP4_A8 biased", ActivationCompute::A8, make_nvfp4_weight,
             {n, k, seed++, Comparison::SampledRows, true, biased_calls,
-             ActivationSigns::Biased, true});
+             ActivationSigns::Biased, DType::BF16, true});
         failures += verify_workspace_envelopes(QType::NVFP4, n, k);
     }
     constexpr std::array head_a8{
@@ -71,10 +71,10 @@ int qualify() {
             ops::detail::nvfp4_ada_route_key(ops::detail::Nvfp4AdaOp::Linear,n,5120),"a8");
         failures += run_shape("NVFP4 head A8", ActivationCompute::A8, make_nvfp4_weight,
             {n, 5120, seed++, Comparison::SampledRows, true, head_a8,
-             ActivationSigns::Centered, true});
+             ActivationSigns::Centered, DType::BF16, true});
         failures += run_shape("NVFP4 head A16", ActivationCompute::A16, make_nvfp4_weight,
             {n, 5120, seed++, Comparison::SampledRows, true, head_a16,
-             ActivationSigns::Centered, true});
+             ActivationSigns::Centered, DType::BF16, true});
         failures += verify_workspace_envelopes(QType::NVFP4, n, 5120);
     }
     // Auto permission must follow the production A16 choice, including the
@@ -86,7 +86,21 @@ int qualify() {
         Invocation{1025,CallForm::Policy,ops::LinearPolicy::AllowA4,true}};
     for (const auto [n,k] : {std::pair{34816,5120},std::pair{5120,17408}})
         failures+=run_shape("NVFP4 auto A16",ActivationCompute::A16,make_nvfp4_weight,
-            {n,k,1921U,Comparison::SampledRows,true,auto_calls,ActivationSigns::Biased,true});
+            {n,k,1921U,Comparison::SampledRows,true,auto_calls,ActivationSigns::Biased,DType::BF16,true});
+
+    // FP32 tensor-parallel partials must retain the A16 arithmetic even when a registered Ada
+    // shape's profile selects A8 for ordinary BF16 output.
+    {
+        const ops::DeviceRouteForce candidate("nvfp4_linear/5120x6144", "a8");
+        constexpr std::array partial_calls{
+            Invocation{1, CallForm::Policy, ops::LinearPolicy::AllowA8, true},
+            Invocation{17, CallForm::Policy, ops::LinearPolicy::AllowA8},
+            Invocation{65, CallForm::Policy, ops::LinearPolicy::AllowA8, true},
+        };
+        failures += run_shape("NVFP4 FP32 partial A16", ActivationCompute::A16, make_nvfp4_weight,
+                              {5120, 6144, 1922U, Comparison::SampledRows, true, partial_calls,
+                               ActivationSigns::Centered, DType::FP32, true});
+    }
 
     // An interval ending in A16 still has to reserve workspace for an A8
     // band inside it. Exercise the public envelope under an actual profile.

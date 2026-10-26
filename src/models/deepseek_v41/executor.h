@@ -4,13 +4,24 @@
 // ring of its last window of attention latents (and a round's drafts), and per kv source block
 // the compressed latents and the indexer's keys of every compressed position, with the ratio-2
 // compressor's incomplete group in a small tail. Prompt chunks attend through a staging ring that
-// every sequence's chunks share; decode steps run one token of each of several sequences at once,
+// every sequence's chunks share, a span of several chunks block by block when experts stay off
+// the device; decode steps run one token of each of several sequences at once,
 // replayed from a CUDA graph per batch size. The Engram rows a pass addresses are read before it
 // from the table's files (or RAM) and copied to the device.
 //
 // With draft_tokens, verify() runs a sequence's next token (its anchor) and up to draft_tokens
-// proposed tokens after it (a context lookup's) as decode rows, and commit() keeps the first ones.
-// Branches (forward_branches) run one after another from a copy of the sequence's state.
+// proposed tokens after it (a context lookup's or the drafter's) as decode rows, and commit() keeps
+// the first ones. Branches (forward_branches) run one after another from a copy of the sequence's
+// state.
+//
+// With the model's DSpark drafter, every pass taps the streams entering the drafter's target
+// blocks for its last rows (a window at most), and those rows seed each sequence's drafter rings
+// (a verification's at commit(), the rows kept). draft() runs the drafter's block after a
+// sequence's anchor at its next positions, from a CUDA graph.
+//
+// With the model's vision tower (vision_max_patches), encode_image() turns an image's patches into
+// its span's rows, and a prompt call's image rows take the place of their tokens' embeddings: they
+// route with the image routing bias, and the Engram neither adds to them nor looks back past them.
 
 #include "core/arena.h"
 #include "core/device.h"
@@ -54,10 +65,25 @@ struct ExecutorOptions {
     // Host or disk experts: the cache's first contents, the most routed of these counts
     // ([expert layer][expert]) once warm-up is done; none leaves the cache empty then.
     std::optional<ExpertRouteCounts> expert_profile;
+    // The share 0..1 of a decode or verification call's missing experts the GPU copies; the CPU
+    // computes the rest (cpu_experts.h). Unset: each call splits its misses by measured CPU and
+    // bus times. CPU threads: 0 for one per physical core.
+    std::optional<float> expert_dma_share;
+    std::uint32_t expert_cpu_threads = 0;
     // The Engram table's rows and how they are read; none runs the model without its Engram (a
     // non-standard mode that degrades the output).
     std::optional<qwen4_exp::NgramTableLayout> engram_table;
     qwen4_exp::NgramReadOptions engram_read;
+    // Prompt calls may carry images (a model loaded with its vision tower): the most patches an
+    // image has, which sizes the tower's scratch. 0: text only.
+    std::uint32_t vision_max_patches = 0;
+};
+
+// An image's rows in a prompt call: the call's rows from `row` on, as many as `embeddings` holds
+// (BF16 [rows][hidden] in host memory, a slice of the span encode_image() wrote).
+struct ImageRows {
+    std::uint32_t row = 0;
+    std::span<const std::uint16_t> embeddings;
 };
 
 struct ExecutorMemory {
@@ -67,8 +93,14 @@ struct ExecutorMemory {
     std::uint64_t kv_backed_bytes = 0;
     bool kv_grows                 = false;
     std::uint64_t workspace_bytes = 0;
+    // The most a prompt span borrows from an elastic expert cache while it runs (0: none).
+    std::uint64_t span_borrow_bytes = 0;
     // Engram rows held in RAM (a table read whole, or the reader's row cache).
     std::uint64_t engram_resident_bytes = 0;
+    // The vision tower: the scratch of one encode within workspace_bytes, and the device bytes the
+    // tower and its image buffers own beside the model's weights.
+    std::uint64_t vision_encode_bytes = 0;
+    std::uint64_t vision_owned_bytes  = 0;
     ExpertDeliveryMemory experts;
 };
 
@@ -113,10 +145,25 @@ public:
     // The Engram reader's counters, or empty without the Engram.
     [[nodiscard]] std::optional<NgramTableStats> engram_stats() const;
     [[nodiscard]] std::string engram_description() const;
-    // Runs up to prefill_chunk tokens at the sequence's next positions and leaves the logits of the
-    // last `logit_rows` (at most kMaxLogitRows) in logits().
+    // The CPU's share of missing experts (its threads and kernels), or empty when the GPU copies
+    // every miss.
+    [[nodiscard]] std::string expert_cpu_description() const;
+    // Prompt tokens one forward() may take: prefill_chunk, or with host or disk experts a span of
+    // several chunks (as many as memory allows beside the expert cache), which forward() runs
+    // layer by layer so that each block's missing experts cross the bus once for all of them.
+    [[nodiscard]] std::uint32_t prompt_step() const noexcept;
+    // Runs up to prompt_step() tokens at the sequence's next positions and leaves the logits of
+    // the last `logit_rows` (at most kMaxLogitRows) in logits(). `images` (in row order, apart)
+    // replace their rows' embeddings.
     void forward(std::uint32_t sequence, std::span<const std::int32_t> tokens,
-                 std::uint32_t logit_rows);
+                 std::uint32_t logit_rows, std::span<const ImageRows> images = {});
+    // Whether prompt calls may carry images.
+    [[nodiscard]] bool vision() const noexcept;
+    // The span rows of an image of grid_w x grid_h patches (BF16 [grid_h * grid_w][patch features]
+    // in host memory, row by row) into `rows` (BF16 [span tokens][hidden]); returns once they are
+    // there.
+    void encode_image(std::span<const std::uint16_t> patches, int grid_w, int grid_h,
+                      std::span<std::uint16_t> rows);
     // Branches of a prompt, each continuing the sequence from its position: branch b runs
     // `lengths[b]` of `tokens` (in branch order, each at most prefill_chunk, at most kMaxLogitRows
     // branches). Leaves the logits of each branch's last token in logits(), one column per branch
@@ -134,6 +181,13 @@ public:
     [[nodiscard]] Tensor logits(std::uint32_t rows) const;
 
     [[nodiscard]] std::uint32_t draft_tokens() const noexcept;
+    // The DSpark drafter's block, the drafts a draft() proposes; 0 without the drafter.
+    [[nodiscard]] std::uint32_t dspark_block() const noexcept;
+    // The drafter's greedy drafts of the dspark_block() positions after the sequence's next token
+    // `anchor` (not yet run), and the confidence of each. The sequence's position and backbone
+    // state do not change.
+    void draft(std::uint32_t sequence, std::int32_t anchor, std::span<std::int32_t> drafts,
+               std::span<float> confidence);
     // tokens.size() / sequences.size() tokens of each sequence (its anchor, then its drafts) at its
     // next positions, as decode rows: logits one column each, sequence by sequence. The positions
     // advance only with commit().

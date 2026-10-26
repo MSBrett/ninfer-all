@@ -70,11 +70,14 @@ GSQ-RCO GGUF (IQ1_M) and its Engram table GGUF with the ggml blocks kept as stor
 Qwen3.5 frontend in a DeepSeek dialect (the converter's transcription of the release's encoder as
 its chat template, DSML tool calls, reasoning opened by the prompt), runs one to eight sequences in
 prompt chunks of 2048 tokens with BF16 caches, keeps the release's FP8/FP4 attention roundings,
-drafts by context lookup only (the GGUF has no draft blocks), and keeps its routed experts in pinned
-host memory or in the artifact's files (read into bounded buffers, never mapped), every miss copied
-to the GPU: its IQ1/IQ2 blocks have no CPU kernels. Its Engram table is embedded or a separate
-table artifact (`--ngram-table`), read a row at a time or held in RAM. No vision, rotation scaling,
-pipeline stages or tensor parallelism.
+drafts with the release's DSpark drafter (the artifact's `dspark` component from Unsloth's GGUF,
+`--spec dspark`) or by context lookup, and keeps its routed experts in pinned host memory or in the
+artifact's files (read into bounded buffers, never mapped), CPU threads computing a share of a
+decode call's misses from the stored IQ1/IQ2 blocks while the GPU copies the rest. Its Engram
+table is embedded or a separate table artifact (`--ngram-table`), read a row at a time or held in
+RAM. It encodes images with the release's vision tower (the artifact's `vision` component, from the
+release's mmproj and its routing bias of image positions; resident or streamed from pinned memory).
+No video, rotation scaling, pipeline stages or tensor parallelism.
 Flash-Next's dense and attention arithmetic runs on the GPU. Of a decode or verification call's
 routed experts that the device cache lacks, CPU threads may compute a share from the host copy
 while the GPU copies and runs the rest (hybrid execution, `--expert-dma-share`), including a share
@@ -111,7 +114,8 @@ round state and sampling stay on the first device; design in
 requests, bounded FIFO ingress (whose one-token reads trade places by remaining work), no
 active-request preemption, and one compact decode batch per
 round. Tensor parallelism (`--tensor-parallel`) divides the GDN heads and dense FFN rows of a dense
-Qwen3.5-core model over the devices, with attention, KV, head and MTP on the first.
+Qwen3.5-core model over the devices in shares sized to each card (`--tensor-split`, or measured
+bandwidth and free memory), with attention, KV, head and MTP on the first.
 Generation and offline CausalScoring use the same public `.ninfer` Engine route. Delivered
 capabilities and commands are documented in `README.md`, the product guides, and executable
 `--help`. New mathematical architectures, execution platforms, large-scale/preemptive continuous

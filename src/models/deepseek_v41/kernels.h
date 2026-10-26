@@ -36,6 +36,11 @@ void gemm_f32(int m, int n, int k, const float* w, const float* x, float* out, c
 // h[t][s] = h[t][0] for the streams s > 0.
 void expand_streams(float* h, int tokens, int streams, int hidden, cudaStream_t stream);
 
+// h[(row + i) * stride + c] = rows[i][c] for `count` BF16 rows of `hidden`: an image's span rows
+// in place of their tokens' embeddings.
+void place_rows(const __nv_bfloat16* rows, int count, int hidden, float* h, std::int64_t stride,
+                cudaStream_t stream);
+
 // The hyper-connection coefficients of a site from its projection `mixes` [T][M] (M = (2 + S) S,
 // fn . flatten(h[t])) and the stream h: m = mixes * rsqrt(mean(h[t]^2) + norm_eps), then
 //   pre[t][s]     = sigmoid(m[s] scale[0] + base[s]) + hc_eps
@@ -183,7 +188,8 @@ void select_topk(const float* scores, int width, int tokens, const std::int32_t*
                  int ratio, int k, std::int32_t* out, cudaStream_t stream);
 
 // Sparse attention of each row's heads over its window (positions p - window_size + 1 .. p, from
-// slot position % ring of the window cache) and its selected compressed latents
+// slot position % ring of the window cache, window_size at most the ring and, beside k selected
+// latents, 1152 - k) and its selected compressed latents
 // (compressed[topk[t][i]] for the leading entries that are not negative), every latent its own key
 // and value; each head's sink logit joins the softmax denominator:
 //   out = sum_j e^(s_j - m) v_j / (sum_j e^(s_j - m) + e^(sink - m)),  s_j = scale q . k_j.
@@ -212,15 +218,17 @@ void sparse_attention(const AttentionArgs& args, cudaStream_t stream);
 
 // The attention output for the grouped output projection: its last 64 values of each head turned
 // back at the row's position, rounded to BF16, fp8-rounded per 32 values, into
-// out[g][t][heads / groups * 512] for group g of the heads.
+// out[g][t][heads / groups * 512] for group g of the heads, or with `token_major` out[t][heads * 512].
 void attention_output(const __nv_bfloat16* o, int tokens, int heads, int groups,
-                      const std::int32_t* positions, const float* freq, __nv_bfloat16* out,
-                      cudaStream_t stream);
+                      const std::int32_t* positions, const float* freq, bool token_major,
+                      __nv_bfloat16* out, cudaStream_t stream);
 
 // The router: scores s = sqrt(softplus(logits)), the top_k experts by s + bias (lower id first on
 // equal values), each weighted s / (sum of the chosen s + 1e-20) * scale. ids/weights [T][top_k].
+// With `image` (a flag per token), an image token's bias is image_bias.
 void route(const float* logits, const float* bias, int tokens, int experts, int top_k, float scale,
-           std::int32_t* ids, float* weights, cudaStream_t stream);
+           std::int32_t* ids, float* weights, cudaStream_t stream,
+           const float* image_bias = nullptr, const std::uint8_t* image = nullptr);
 
 // out[r][i] = bf16(silu(min(g, limit)) * clamp(u, -limit, limit)) for rows of [g (width);
 // u (width)] FP32 x, `x_stride` apart, g and u first multiplied by scale[r / per_token] (when
@@ -241,6 +249,12 @@ struct MoeCombineArgs {
 };
 void moe_combine(const MoeCombineArgs& args, cudaStream_t stream);
 
+// sums[i] += products[i] for i < n when *flag is nonzero: the 2^-32 fixed-point sums of the
+// routed experts the CPU computed for a call (ExpertDelivery), added as the expert kernels add
+// theirs, modulo 2^64.
+void add_fixed(unsigned long long* sums, const void* products, const std::int32_t* flag,
+               std::int64_t n, cudaStream_t stream);
+
 // IQ4_NL rows of 256 values (144 bytes each) as BF16.
 void engram_rows(const std::uint8_t* rows, int count, __nv_bfloat16* out, cudaStream_t stream);
 
@@ -249,8 +263,9 @@ void engram_rows(const std::uint8_t* rows, int count, __nv_bfloat16* out, cudaSt
 //   dot = sum_i h[s][i] w[s][i] key[s][i] * rsqrt(mean(h[s]^2) + eps) * rsqrt(mean(key[s]^2) + eps)
 //         / sqrt(H)
 //   h[s] += sigmoid(sign(dot) sqrt(max(|dot|, 1e-6))) * value.
+// With `image` (a flag per token), an image token's streams stay as they are.
 void engram_gate(float* h, const float* kv, const float* w, int tokens, int streams, int hidden,
-                 float eps, cudaStream_t stream);
+                 float eps, cudaStream_t stream, const std::uint8_t* image = nullptr);
 
 // The matrix and vector activations of some GGUF types keep each 32 values' sum in F16
 // (gguf::*_activation_f16_sums): a column of the BF16 x [columns][rows] (rows % 32 == 0) whose
@@ -276,6 +291,28 @@ void ring_copy(const __nv_bfloat16* src, int src_ring, __nv_bfloat16* dst, int d
                int end, cudaStream_t stream);
 
 void f32_to_bf16(const float* in, __nv_bfloat16* out, std::int64_t n, cudaStream_t stream);
+
+// The DSpark drafter's taps: out[t][i] = sum_s h[t][s][i] / streams for rows of h [T][S][H], out
+// rows `out_stride` apart.
+void stream_mean(const float* h, int tokens, int streams, int hidden, float* out,
+                 std::int64_t out_stride, cudaStream_t stream);
+
+// The rank of the drafter's Markov tables.
+inline constexpr int kMarkovRank = 256;
+
+// One greedy step of the drafter's Markov chain: ids[step + 1] = the token v < domain with the
+// highest logits[v] + sum_r head[v][r] embed[ids[step]][r] (lower v first among equal values),
+// logits FP32 [domain or more], head and embed BF16 [vocab][kMarkovRank]. `scratch` holds
+// markov_scratch_bytes().
+[[nodiscard]] std::size_t markov_scratch_bytes();
+void markov_step(const float* logits, const __nv_bfloat16* head, const __nv_bfloat16* embed,
+                 int domain, std::int32_t* ids, int step, void* scratch, cudaStream_t stream);
+
+// The drafter's confidence of each row t: sigmoid(sum_i x[i] w[i] + sum_r embed[ids[t]][r]
+// w[hidden + r]) for the FP32 collapse x = sum_s pre[t][s] h[t][s] (h [T][S][H], pre [T][S]).
+void dspark_confidence(const float* h, const float* pre, int tokens, int streams, int hidden,
+                       const float* w, const __nv_bfloat16* embed, const std::int32_t* ids,
+                       float* out, cudaStream_t stream);
 
 // The reference roundings, for tests: one value to E4M3 (|x| <= 448) and to E2M1 (|x| <= 6), to
 // nearest with ties to even.

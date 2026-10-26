@@ -142,6 +142,9 @@ Gemma 4 places its tower the same three ways with its own mechanics: `overlay` k
 blocks' matrices in pinned host memory and streams them through a two-block device window during
 each encode (about 0.14 GiB of device memory instead of 1.07 GiB), and `cpu` runs an FP32 tower
 with AVX2/FMA kernels. Its budgets, layout and measurements are in [Gemma 4](gemma4.md#images-and-video).
+DeepSeek-V4.1 keeps its tower `resident` or `overlay`, which streams the 32 blocks' matrices
+through a two-block device window as Gemma 4's does, and refuses `cpu`
+([DeepSeek-V4.1](deepseek-v41.md#images)).
 
 ### Image detail
 
@@ -153,7 +156,8 @@ for a cheaper and coarser look. The same bytes at both details are prepared, cac
 two different images. Any other value is refused with `image_detail_not_supported`, or read as
 `auto` when the server runs with `--lenient-image-detail`. Gemma 4 maps the three to its budgets:
 `low` 70 soft tokens, `auto` the release's 280, `high` the `--vision-max-merged` bound (1120 by
-default).
+default). DeepSeek-V4.1 gives an image's span at most the release's 1024 prompt positions (fewer
+with `--vision-max-merged`) at `auto` and `high`, and a quarter of that at `low`.
 
 ## Several models (router)
 
@@ -513,7 +517,7 @@ read-only and fills only the llama.cpp fields NInfer can state truthfully:
    "params": {"n_predict": -1, "max_tokens": -1, "temperature": 1.0, "top_k": 20, "top_p": 0.95,
               "min_p": 0.0, "presence_penalty": 0.0, "frequency_penalty": 0.0, "seed": -1}},
  "total_slots": 1, "model_alias": "qwen3.8-27b", "model_path": "models/qwen3_8_27b.ninfer",
- "modalities": {"vision": false, "audio": false}, "build_info": "ninfer 0.12.0-rtx3090+v0.12.0-rtx3090-57-ge1debb451",
+ "modalities": {"vision": false, "audio": false}, "build_info": "ninfer 2026-10-25.1+2026-10-25.1-5-gb3402a6fd",
  "endpoint_slots": true, "endpoint_props": true, "endpoint_metrics": true,
  "cors_proxy_enabled": false}
 ```
@@ -531,12 +535,14 @@ public model id and `model_path` the artifact path the server was started with.
 
 ### Server version
 
-The running build is reported from one string, `<VERSION>+<build id>`: `ninfer-serve --version`
+The running build is reported from one string, `<version>+<build id>`: `ninfer-serve --version`
 and `ninfer --version` print it and exit without loading a model; `GET /health` returns it as
-`{"status": "ok", "version": "0.12.0-rtx3090+v0.12.0-rtx3090-57-ge1debb451"}`; every response,
+`{"status": "ok", "version": "2026-10-25.1+2026-10-25.1-5-gb3402a6fd"}`; every response,
 the `503` during model load and `401` failures included, carries it in an `X-NInfer-Version`
 header; and the startup log, the `server_start` record and `/props` `build_info` include it.
-`VERSION` is the repository's file of that name. The build id is `git describe --always --tags` of
+The version is the build's release tag (`YYYY-MM-DD.N`): a published release reports the tag it is
+released under; any other build reports the release tag at or before its commit, or `untagged` when
+its checkout has no tags. The build id is `git describe --always --tags` of
 the compiled tree with `-dirty` when its product sources differ from `HEAD`, or the
 `NINFER_BUILD_ID` environment variable of the build when it is set, as on rented build hosts that
 compile a snapshot without git metadata.
@@ -1160,7 +1166,9 @@ for greedy decoding) and normalized over the whole vocabulary. `top_k`, `top_p` 
 change them. A token the mask excludes never appears among the alternatives, so a constrained
 position can report fewer than asked, and a sampled token outside its position's 20 most likely
 tokens reports OpenAI's `-9999.0`. Under speculative decoding a verified position's penalties count
-the drafts before it, as its sampling does.
+the drafts before it, as its sampling does. The reduction over the vocabulary splits every row the
+same way, so a position's values have the same bits whether its logits are reduced alone, in a
+verification pass or beside other requests' rows.
 
 Records cover the content channel: every generated token after the reasoning block and the
 whitespace that closes it, the markup of a tool call included; reasoning tokens and the stop token
@@ -2134,11 +2142,12 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--device N` | CUDA device index | `0` |
 | `--devices A,B,...` | one pipeline stage per listed CUDA device (2 to 8; the cards may differ where the build runs on each; see [pipeline stages](maintainer/pipeline-stages.md)); on the Qwen3.5 family MTP, DFlash, DFlash2 and resident or CPU Vision run across the stages (the Vision tower stays on the first device; `--vision-residency overlay` is refused); overrides `--device` | none |
 | `--stage-layers A,B,...` | layers per stage, in `--devices` order; omitted means a split chosen from each device's free memory | memory-balanced |
-| `--tensor-parallel` | the `--devices` share every layer instead of dividing the layers: GDN heads and dense FFN rows per device, attention, KV, head and MTP on the first; dense Qwen3.5-core models with GGUF weights ([tensor parallelism](maintainer/pipeline-stages.md#tensor-parallelism)) | off |
+| `--tensor-parallel` | the `--devices` share every layer instead of dividing the layers: GDN heads and dense FFN rows per device, attention, KV, head and MTP on the first; dense Qwen3.5-core models in every weight format ([tensor parallelism](maintainer/pipeline-stages.md#tensor-parallelism)) | off |
+| `--tensor-split A,B,...` | with `--tensor-parallel`, the relative size of each device's share, one positive number per `--devices` entry; shares end on whole stored blocks, so the split is the nearest one the weights allow | by each card's measured copy bandwidth, capped by its free memory |
 | `--expert-residency device\|host\|disk` | routed MoE experts on GPU, in pinned host memory, or in artifact files: [native Qwen](maintainer/qwen3_5-model.md#routed-expert-residency), [Gemma 4](gemma4.md#expert-residency), [Flint](flint.md#expert-residency) and [Flash-Next](qwen3-8-flash-next.md#run). Native Qwen, Gemma 4 and Flint bring misses into whole-layer device banks | `device` |
 | `--expert-cache-mib N\|auto` | with host or disk experts, device memory for the most used experts; native Qwen, Gemma 4 and Flint allow `0` and then keep only their layer banks, and Flash-Next disk mode needs a cache. With automatic KV, native Qwen gives the cache priority over KV beyond one request's context | `auto` (what is free after startup) |
 | `--expert-misses staged\|mapped` | Qwen3.8-Flash-Next only, GGUF host experts: copy each missing expert to the device while the cached experts run, into a cache slot when the [expert tier](qwen3-8-flash-next.md#the-expert-cache) admits it (`staged`), or let the expert kernels read the missing ones across the bus (`mapped`) | `staged` |
-| `--expert-dma-share F\|auto` | Host or disk experts: the GPU's share of a call's cache misses, `0..1`; the CPU computes the rest (GGUF and Qwen3.5/3.6 MoE experts: the GPU's results bit for bit); `auto` splits each such call by the copy and CPU times measured on earlier calls and copies every miss of Flash-Next native experts. Flash-Next, Gemma 4 and Flint calls of more than eight tokens, and Qwen3.5/3.6 calls that route to half the experts or more, always use the GPU ([the CPU share](qwen3-8-flash-next.md#the-cpu-share)) | `auto` |
+| `--expert-dma-share F\|auto` | Host or disk experts: the GPU's share of a call's cache misses, `0..1`; the CPU computes the rest (GGUF and Qwen3.5/3.6 MoE experts: the GPU's results bit for bit); `auto` splits each such call by the copy and CPU times measured on earlier calls and copies every miss of Flash-Next native experts. Flash-Next, Gemma 4, Flint and DeepSeek-V4.1 calls of more than eight tokens, and Qwen3.5/3.6 calls that route to half the experts or more, always use the GPU ([the CPU share](qwen3-8-flash-next.md#the-cpu-share)); DeepSeek-V4.1's `auto` copies every miss of disk experts ([its CPU share](deepseek-v41.md#the-cpu-share)) | `auto` |
 | `--expert-tail-skip N` | Qwen3.8-Flash-Next only, GGUF host experts with staged misses: a decode or verification call leaves out each routed expert its device cache lacks when every token of the call ranks it past place `N` (`1..9`) of its top ten; the other experts keep their router weights, so results change | off |
 | `--expert-prefill-buffers 1\|2` | Qwen3.8-Flash-Next only, GGUF host experts: device buffers a long prompt's uncached experts are copied into; `2` copies the next layer's while the current layer's experts run, when half the free memory holds both. With the automatic cache the buffers hold expert cache slots between prompts ([the expert cache](qwen3-8-flash-next.md#the-expert-cache)) | `2` with the automatic expert cache, else `1` |
 | `--expert-cpu-threads N` | Host or disk experts with a CPU share: `1..256` CPU threads, the calling one included, pinned one to a physical core | `min(physical cores, usable CPUs / 2)`, at least one. Usable CPUs: the process's affinity mask, bounded by a container's CPU quota; physical cores: those in the mask. A 30-CPU container quota gives 15 threads, a 16-core/32-thread desktop 16 |

@@ -80,6 +80,26 @@ int run_tests() {
         (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--draft-min-p", "0.3"});
     }), "CLI accepted draft confidence without MTP");
     {
+        // DeepSeek's DSpark drafter: its whole block without --draft-tokens, no copy drafts beside
+        // it unless asked, and neither a proposal head nor MTP's confidence floor.
+        const auto block = parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--spec", "dspark"});
+        const auto three = parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--spec", "dspark",
+                                  "--draft-tokens", "3"});
+        failures += check(block.speculative.backend == ninfer::SpeculativeBackend::DSpark &&
+                              block.speculative.draft_tokens == 0 &&
+                              block.speculative.ngram_draft_tokens == 0 &&
+                              three.speculative.draft_tokens == 3,
+                          "CLI did not preserve --spec dspark");
+        for (const std::vector<std::string> tail :
+             {std::vector<std::string>{"--lm-head-draft"}, {"--draft-min-p", "0.3"},
+              {"--draft-tokens", "16"}}) {
+            std::vector<std::string> args{"ninfer-cli", "model.ninfer", "--prompt", "x", "--spec", "dspark"};
+            args.insert(args.end(), tail.begin(), tail.end());
+            failures += check(rejects([&] { (void)parse(args); }),
+                              ("CLI accepted " + tail.front() + " beside --spec dspark").c_str());
+        }
+    }
+    {
         // Without --spec the Engine chooses; --spec none and every backend are explicit.
         const auto unset = parse({"ninfer-cli", "model.ninfer", "--prompt", "x"}).speculative;
         const auto none  = parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--spec", "none"}).speculative;
@@ -508,6 +528,24 @@ int run_tests() {
                               (void)parse(args);
                           }),
                           "--tensor-parallel without several devices was accepted");
+    }
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--devices", "0,1",
+                             "--tensor-parallel", "--tensor-split", "3,1.5"})
+                              .tensor_split == std::vector<double>{3.0, 1.5},
+                      "--tensor-split did not reach the options");
+    for (const std::vector<std::string>& split :
+         {std::vector<std::string>{"--tensor-parallel", "--tensor-split", "1,2,3"},
+          std::vector<std::string>{"--tensor-split", "1,1"},
+          std::vector<std::string>{"--tensor-parallel", "--tensor-split", "1,0"},
+          std::vector<std::string>{"--tensor-parallel", "--tensor-split", "1,"},
+          std::vector<std::string>{"--tensor-parallel", "--tensor-split", "1,x"}}) {
+        failures += check(rejects([&] {
+                              std::vector<std::string> args{"ninfer-cli", "model.ninfer", "--prompt",
+                                                            "hello", "--devices", "0,1"};
+                              args.insert(args.end(), split.begin(), split.end());
+                              (void)parse(args);
+                          }),
+                          "a malformed or misplaced --tensor-split was accepted");
     }
     failures += check(parse({"ninfer", "model.ninfer", "--prompt", "x", "--spec", "mtp",
                              "--draft-tokens", "3", "--mtp-attention-window", "2048"})

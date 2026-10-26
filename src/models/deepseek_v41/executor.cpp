@@ -4,7 +4,9 @@
 #include "core/growable_region.h"
 #include "core/vmm.h"
 #include "core/weight_view.h"
+#include "models/deepseek_v41/cpu_experts.h"
 #include "models/deepseek_v41/kernels.h"
+#include "models/deepseek_v41/vision.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/weight_input.h"
 #include "ops/linear/gguf/ggml_bridge.h"
@@ -52,6 +54,14 @@ const float* fp32(const Model& model, WeightId id, std::int64_t count) {
     return static_cast<const float*>(tensor.data);
 }
 
+const __nv_bfloat16* bf16_table(const Model& model, WeightId id, std::int64_t rows, std::int64_t columns) {
+    const Tensor tensor = weight_tensor(model.weight(id).view, {std::int32_t(columns), std::int32_t(rows)});
+    if (tensor.dtype != DType::BF16) {
+        throw std::invalid_argument(model.weight(id).name + " must be stored as bf16");
+    }
+    return static_cast<const __nv_bfloat16*>(tensor.data);
+}
+
 Weight matrix(const Model& model, WeightId id) {
     const Weight w = ops::prepare_linear_weight(model.input(id)).weight;
     if (!is_gguf(w.qtype)) {
@@ -92,7 +102,8 @@ std::vector<float> rope_freq(int dim, float base, std::uint32_t original, float 
     }
     if (original == 0) { return f; }
     const auto corrected = [&](double rotations) {
-        return dim * std::log(double(original) / (rotations * 2 * std::numbers::pi)) / (2 * std::log(double(base)));
+        return dim * std::log(double(original) / (rotations * 2 * std::numbers::pi)) /
+               (2 * std::log(double(base)));
     };
     const double low  = std::max(std::floor(corrected(beta_fast)), 0.0);
     const double high = std::min(std::ceil(corrected(beta_slow)), double(dim - 1));
@@ -136,11 +147,13 @@ struct Site {
 
 struct LayerPlan {
     int ratio = 0;
+    int experts = 0, top_k = 0; // the block's routed experts and how many a row takes
     bool kv_source = false, index_source = false, candidate_source = false, uses_candidates = false;
     int kv_from = -1; // the kv source whose caches the block reads
     Site hc_attention, hc_ffn;
     std::vector<Weight> query_kv; // [query_a; kv] as one parent, or the two
     Weight query_b, output_a, output_b, shared_down;
+    DeviceBuffer output_groups; // output_a's row groups: the experts of the grouped decode product
     std::vector<Weight> shared_gate_up;
     const float *attention_norm = nullptr, *ffn_norm = nullptr, *query_norm = nullptr,
                 *kv_norm = nullptr, *sinks = nullptr, *freq = nullptr;
@@ -149,6 +162,7 @@ struct LayerPlan {
                 *index_key = nullptr, *index_key_norm = nullptr, *index_query = nullptr,
                 *index_weights = nullptr;
     const float *router = nullptr, *router_bias = nullptr;
+    const float* image_bias = nullptr; // with the vision tower: the router's bias of image tokens
     gguf::GgmlType gate_up_type{}, down_type{};
     std::int64_t gate_up_row_bytes = 0, down_row_bytes = 0;
     DeviceBuffer tables; // device experts: [E] gate, [E] up, [E] gate_up, [E] down
@@ -174,13 +188,21 @@ struct GraphEntry {
     bool warmed = false; // ran once eagerly, so every kernel is loaded before the capture
 };
 
-// The rows of a pass: a prompt chunk of one sequence, or decode rows of one sequence each.
+// The rows of a pass: a prompt chunk of one sequence, or decode rows of one sequence each. A
+// chunk of a prompt span reads its staged rows from `row` of the span's `staged` rows.
 struct Pass {
     int t     = 0;
     bool chunk = false;
+    int row = 0, staged = 0; // staged 0: the pass's own t rows
     std::uint32_t sequence = 0, first = 0;
     // The rows whose logits the pass keeps (the last ones), and the logit column of the first.
     int logit_rows = 0, logit_column = 0;
+    // With the drafter: whether the pass's tapped rows seed its rings now (a verification's wait for
+    // commit()). A draft block's rows attend as if at `visible` (each the block's last position) over
+    // `extra_window` keys past the window.
+    bool seed = true;
+    const std::int32_t* visible = nullptr;
+    int extra_window = 0;
 };
 
 } // namespace
@@ -204,12 +226,17 @@ struct Executor::Impl {
     std::atomic<std::uint64_t> kv_backed{0};
     std::uint64_t kv_fixed = 0, kv_bytes = 0;
     std::vector<LayerPlan> layers;
+    // The CPU's share of missing experts; it outlives the delivery that calls it.
+    std::unique_ptr<CpuExperts> cpu_experts;
     std::unique_ptr<ExpertDelivery> delivery;
     mutable std::mutex expert_stats_mutex;
     ExpertDeliveryStats expert_startup_stats;
     Weight embedding, head;
     const float* final_norm = nullptr;
     DeviceBuffer freq_window, freq_compressed;
+    // The grouped output projection's routing for each decode width t (group_routing(t)).
+    DeviceBuffer group_routes;
+    std::vector<std::size_t> group_routes_at;
     std::vector<std::uint32_t> positions;
     DeviceBuffer d_tokens, d_positions, d_sequences;
     std::unique_ptr<PinnedHostBuffer> h_staging;
@@ -217,6 +244,15 @@ struct Executor::Impl {
     DeviceBuffer logits_bf16;
     std::unique_ptr<WorkspaceArena> workspace;
     std::size_t workspace_bytes = 0;
+    // Layer-major prompt spans (forward_span): with host or disk experts, every chunk of a span
+    // passes a block before any passes the next, so the block's wide calls copy the experts the
+    // cache lacks once per span instead of once per chunk. span_tokens is 0 when spans are off.
+    // Beside an elastic expert cache a span borrows its streams, coefficients and selections from
+    // the cache (span_buffers) and gives them back after it, so decode keeps the whole cache; a
+    // fixed cache leaves them in the workspace.
+    static constexpr std::uint32_t kSpanChunks = 8;
+    std::uint32_t span_tokens = 0;
+    std::size_t span_borrow_bytes = 0;
     std::map<std::uint32_t, GraphEntry> graphs;
     std::uint32_t verify_width = 0;
     int capacity_rows = 0;   // the largest compressed cache, a decode pass's score width
@@ -234,7 +270,40 @@ struct Executor::Impl {
     std::vector<std::uint64_t> engram_scratch;
     // One sequence's rings and tails, the state a branch pass returns to.
     DeviceBuffer branch_state;
-    std::vector<int> decode_splits; // by decode rows
+    // The vision tower, and a prompt step's images: their rows' flags (pinned, then on the
+    // device, one byte per staged row), the pieces of their span rows a step places, the device
+    // rows a piece passes through (one image span at most, also the tower's output), the patches
+    // of an image being encoded; the current pass's flags (null without image rows).
+    std::unique_ptr<VisionTower> tower;
+    std::unique_ptr<PinnedHostBuffer> h_image;
+    std::unique_ptr<CudaCompletionEvent> image_staged;
+    DeviceBuffer d_image, d_image_rows, d_patches;
+    std::vector<ImageRows> step_images;
+    std::vector<std::uint8_t> step_dead;
+    const std::uint8_t* image_mask = nullptr;
+    // Decode attention splits: one count for every row count, so a row sums its keys in the same
+    // order however many rows its pass decodes (a verified draft's values are plain decoding's).
+    int decode_splits = 1;
+    // The DSpark drafter (Model::dspark()): its blocks (each with every sequence's window ring),
+    // the backbone blocks it taps (target_of: a block's index among the targets, -1 for none), the
+    // taps of a pass's last rows ([window][targets][hidden] FP32, the streams' mean entering each
+    // target), the seed's kv rows of each block, and a draft's buffers: the anchor and the drafts,
+    // their confidences and the Markov steps' scratch on the device, the drafts and confidences in
+    // pinned memory.
+    struct Drafter {
+        std::vector<LayerPlan> layers;
+        std::vector<int> target_of;
+        int targets = 0, block = 0, domain = 0;
+        std::int32_t noise = 0;
+        Weight fc;
+        std::vector<Weight> kv;
+        const float *tap_norm = nullptr, *final_norm = nullptr, *confidence = nullptr;
+        const __nv_bfloat16 *markov_embed = nullptr, *markov_head = nullptr;
+        DeviceBuffer taps, ids, values, scratch;
+        std::unique_ptr<PinnedHostBuffer> host;
+        std::unique_ptr<CudaCompletionEvent> copied;
+    };
+    std::optional<Drafter> drafter;
 
     Impl(const Model& m, DeviceContext& d, ExecutorOptions o)
         : model(m), device(d), options(std::move(o)), config(m.config()),
@@ -284,6 +353,22 @@ struct Executor::Impl {
             freq_window.copy_from_host(window_freq.data(), window_freq.size() * 4);
             freq_compressed.copy_from_host(yarn_freq.data(), yarn_freq.size() * 4);
         }
+        {
+            // Per width t: bounds, sorted pairs, active groups and their count (see group_routing).
+            std::vector<std::int32_t> words;
+            group_routes_at.assign(std::size_t(gguf::kMaxVectorColumns) + 1, 0);
+            for (int t = 1; t <= gguf::kMaxVectorColumns; ++t) {
+                group_routes_at[std::size_t(t)] = words.size();
+                for (int g = 0; g <= groups; ++g) { words.push_back(g * t); }
+                for (int g = 0; g < groups; ++g) {
+                    for (int j = 0; j < t; ++j) { words.push_back(j * groups + g); }
+                }
+                for (int g = 0; g < groups; ++g) { words.push_back(g); }
+                words.push_back(groups);
+            }
+            group_routes = DeviceBuffer(words.size() * sizeof(std::int32_t));
+            group_routes.copy_from_host(words.data(), words.size() * sizeof(std::int32_t));
+        }
         const int sequences = int(options.sequences);
         {
             // The caches are sized up front for every sequence's whole context: refuse with the
@@ -295,6 +380,11 @@ struct Executor::Impl {
                     const std::size_t rows = options.max_context / config.compress_ratios[i];
                     needed += std::size_t(sequences) * rows * (kLatent + kIndexDim) * 2;
                 }
+            }
+            if (model.dspark()) {
+                needed += model.dspark()->layers.size() * (options.checkpoints ? 2 : 1) *
+                              std::size_t(sequences) * kRing * kLatent * 2 +
+                          std::size_t(window) * model.dspark_config()->target_layers.size() * hidden * 4;
             }
             needed += std::size_t(prefill_ring) * kLatent * 2;
             std::size_t free_bytes = 0, total_bytes = 0;
@@ -315,8 +405,7 @@ struct Executor::Impl {
         std::size_t branch_bytes     = 0;
         for (std::uint32_t i = 0; i < config.num_hidden_layers; ++i) {
             const LayerWeights& lw = w.layers[i];
-            LayerPlan p;
-            p.ratio            = int(config.compress_ratios[i]);
+            LayerPlan p = plan_block(lw, int(config.compress_ratios[i]), experts, top_k);
             p.kv_source        = config.kv_source[i];
             p.index_source     = config.index_source[i];
             p.candidate_source = config.candidate_source == int(i);
@@ -326,23 +415,7 @@ struct Executor::Impl {
             if (p.ratio > 0 && (p.kv_from < 0 || config.index_source_of(i) < 0)) {
                 throw std::invalid_argument("DeepSeek-V4.1: a compressed block before its sources");
             }
-            const std::int64_t mixes = config.hc_mixes(), flat = std::int64_t(streams) * hidden;
-            p.hc_attention = {fp32(model, lw.hc_attention.fn, mixes * flat),
-                              fp32(model, lw.hc_attention.base, mixes),
-                              fp32(model, lw.hc_attention.scale, 3)};
-            p.hc_ffn       = {fp32(model, lw.hc_ffn.fn, mixes * flat), fp32(model, lw.hc_ffn.base, mixes),
-                              fp32(model, lw.hc_ffn.scale, 3)};
-            const auto& at   = lw.attention;
-            p.query_kv       = matrices(model, {at.query_a, at.kv});
-            p.query_b        = matrix(model, at.query_b);
-            p.output_a       = matrix(model, at.output_a);
-            p.output_b       = matrix(model, at.output_b);
-            p.attention_norm = fp32(model, lw.attention_norm, hidden);
-            p.ffn_norm       = fp32(model, lw.ffn_norm, hidden);
-            p.query_norm     = fp32(model, at.query_a_norm, query_rank);
-            p.kv_norm        = fp32(model, at.kv_norm, kLatent);
-            p.sinks          = fp32(model, at.sinks, heads);
-            p.freq = static_cast<const float*>(p.ratio > 0 ? freq_compressed.p : freq_window.p);
+            const auto& at = lw.attention;
             if (p.kv_source) {
                 p.compressor_kv = fp32(model, *at.compressor_kv, std::int64_t(kLatent) * hidden);
                 if (p.ratio > 1) {
@@ -357,30 +430,8 @@ struct Executor::Impl {
                                        std::int64_t(index_heads) * kIndexDim * query_rank);
                 p.index_weights = fp32(model, *at.index_weights, std::int64_t(index_heads) * hidden);
             }
-            const MoeWeights& mw = lw.moe;
-            p.router           = fp32(model, mw.router, std::int64_t(experts) * hidden);
-            p.router_bias      = fp32(model, mw.router_bias, experts);
-            p.shared_gate_up   = matrices(model, {mw.shared_gate, mw.shared_up});
-            p.shared_down      = matrix(model, mw.shared_down);
             if (model.expert_residency() == ExpertResidency::Device) {
-                const Weight gate_up = matrix(model, *mw.gate_up);
-                const Weight down    = matrix(model, *mw.down);
-                p.gate_up_type       = ops::detail::gguf_type(gate_up.qtype);
-                p.down_type          = ops::detail::gguf_type(down.qtype);
-                p.gate_up_row_bytes  = row_bytes(gate_up);
-                p.down_row_bytes     = row_bytes(down);
-                std::vector<const void*> table(4 * std::size_t(experts));
-                for (int x = 0; x < experts; ++x) {
-                    const auto* gu = static_cast<const std::byte*>(gate_up.qdata) +
-                                     std::int64_t(x) * 2 * width * p.gate_up_row_bytes;
-                    table[x]               = gu;
-                    table[experts + x]     = gu + std::int64_t(width) * p.gate_up_row_bytes;
-                    table[2 * experts + x] = gu;
-                    table[3 * experts + x] = static_cast<const std::byte*>(down.qdata) +
-                                             std::int64_t(x) * hidden * p.down_row_bytes;
-                }
-                p.tables = DeviceBuffer(table.size() * sizeof(void*));
-                p.tables.copy_from_host(table.data(), table.size() * sizeof(void*));
+                plan_resident(p, lw.moe);
             } else {
                 p.delivery_layer    = int(i);
                 const auto& bank    = model.expert_banks()[i];
@@ -432,6 +483,7 @@ struct Executor::Impl {
             }
             layers.push_back(std::move(p));
         }
+        if (model.dspark()) { plan_drafter(ring_bytes, branch_bytes); }
         staging = DeviceBuffer(std::size_t(prefill_ring) * kLatent * 2);
         staging.fill(0);
         kv_bytes += staging.bytes;
@@ -448,11 +500,9 @@ struct Executor::Impl {
         }
         kv_backed = kv_fixed;
         const int sms = device.multiprocessor_count();
-        decode_splits.assign(gguf::kMaxVectorColumns + 1, 1);
-        for (int b = 1; b <= gguf::kMaxVectorColumns; ++b) {
-            decode_splits[b] = std::clamp(2 * sms / (heads / 16 * b), 1, 40);
-        }
-        const std::size_t rows = std::max<std::size_t>(options.prefill_chunk, sequences);
+        decode_splits = std::clamp(2 * sms / (heads / 16), 1, 40);
+        span_tokens = plan_span();
+        const std::size_t rows = staging_rows();
         d_tokens    = DeviceBuffer(rows * 4);
         d_positions = DeviceBuffer(rows * 4);
         d_sequences = DeviceBuffer(rows * 4);
@@ -469,7 +519,10 @@ struct Executor::Impl {
             engram_copied = std::make_unique<CudaCompletionEvent>(device);
             engram_scratch.resize(engram_rows);
         }
-        workspace_bytes = plan_workspace();
+        if (options.vision_max_patches > 0) { plan_vision(rows); }
+        span_borrow_bytes = growing && span_tokens != 0 ? span_buffers(span_tokens) : 0;
+        workspace_bytes   = plan_workspace(growing ? 0 : span_tokens);
+        if (tower) { workspace_bytes = std::max(workspace_bytes, tower->workspace_bytes()); }
         {
             std::size_t free_bytes = 0, total_bytes = 0;
             CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
@@ -486,11 +539,148 @@ struct Executor::Impl {
         if (!model.expert_banks().empty()) { plan_delivery(); }
     }
 
-    void plan_delivery() {
-        std::vector<ExpertDeliveryLayer> sources;
+    // The vision tower and the image buffers: a step's flags, a span's rows, an image's patches.
+    void plan_vision(std::size_t rows) {
+        if (!model.vision()) {
+            throw std::invalid_argument("deepseek_v41 executor: images need the model's vision tower");
+        }
+        tower = std::make_unique<VisionTower>(model, options.vision_max_patches);
+        const VisionConfig& vc = tower->config();
+        const float* bias = fp32(model, model.vision()->image_router_bias,
+                                 std::int64_t(config.num_hidden_layers) * experts);
+        for (std::size_t i = 0; i < layers.size(); ++i) {
+            layers[i].image_bias = bias + i * std::size_t(experts);
+        }
+        h_image      = std::make_unique<PinnedHostBuffer>(rows);
+        image_staged = std::make_unique<CudaCompletionEvent>(device);
+        d_image      = DeviceBuffer(rows);
+        d_image_rows = DeviceBuffer(std::size_t(vc.max_image_tokens) * hidden * 2);
+        d_patches    = DeviceBuffer(std::size_t(options.vision_max_patches) * vc.patch_features() * 2);
+    }
+
+    [[nodiscard]] std::uint64_t vision_owned_bytes() const noexcept {
+        if (!tower) { return 0; }
+        return tower->owned_bytes() + d_image.bytes + d_image_rows.bytes + d_patches.bytes;
+    }
+
+    // What every block plans, the backbone's and the drafter's: hyper-connections, the window
+    // attention, the norms, the router and the shared expert.
+    LayerPlan plan_block(const LayerWeights& lw, int ratio, int block_experts, int block_top_k) {
+        LayerPlan p;
+        p.ratio                  = ratio;
+        p.experts                = block_experts;
+        p.top_k                  = block_top_k;
+        const std::int64_t mixes = config.hc_mixes(), flat = std::int64_t(streams) * hidden;
+        p.hc_attention = {fp32(model, lw.hc_attention.fn, mixes * flat),
+                          fp32(model, lw.hc_attention.base, mixes), fp32(model, lw.hc_attention.scale, 3)};
+        p.hc_ffn       = {fp32(model, lw.hc_ffn.fn, mixes * flat), fp32(model, lw.hc_ffn.base, mixes),
+                          fp32(model, lw.hc_ffn.scale, 3)};
+        const auto& at   = lw.attention;
+        p.query_kv       = matrices(model, {at.query_a, at.kv});
+        p.query_b        = matrix(model, at.query_b);
+        p.output_a       = matrix(model, at.output_a);
+        p.output_b       = matrix(model, at.output_b);
+        {
+            std::vector<const void*> parts(static_cast<std::size_t>(groups));
+            for (int g = 0; g < groups; ++g) {
+                parts[std::size_t(g)] = static_cast<const std::byte*>(p.output_a.qdata) +
+                                        std::int64_t(g) * output_rank * row_bytes(p.output_a);
+            }
+            p.output_groups = DeviceBuffer(parts.size() * sizeof(void*));
+            p.output_groups.copy_from_host(parts.data(), parts.size() * sizeof(void*));
+        }
+        p.attention_norm = fp32(model, lw.attention_norm, hidden);
+        p.ffn_norm       = fp32(model, lw.ffn_norm, hidden);
+        p.query_norm     = fp32(model, at.query_a_norm, query_rank);
+        p.kv_norm        = fp32(model, at.kv_norm, kLatent);
+        p.sinks          = fp32(model, at.sinks, heads);
+        p.freq = static_cast<const float*>(p.ratio > 0 ? freq_compressed.p : freq_window.p);
+        const MoeWeights& mw = lw.moe;
+        p.router             = fp32(model, mw.router, std::int64_t(block_experts) * hidden);
+        p.router_bias        = fp32(model, mw.router_bias, block_experts);
+        p.shared_gate_up     = matrices(model, {mw.shared_gate, mw.shared_up});
+        p.shared_down        = matrix(model, mw.shared_down);
+        return p;
+    }
+
+    // Device experts: the tables of each expert's gate, up, gate_up and down rows.
+    void plan_resident(LayerPlan& p, const MoeWeights& mw) {
+        const Weight gate_up = matrix(model, *mw.gate_up);
+        const Weight down    = matrix(model, *mw.down);
+        p.gate_up_type       = ops::detail::gguf_type(gate_up.qtype);
+        p.down_type          = ops::detail::gguf_type(down.qtype);
+        p.gate_up_row_bytes  = row_bytes(gate_up);
+        p.down_row_bytes     = row_bytes(down);
+        const int e          = p.experts;
+        std::vector<const void*> table(4 * std::size_t(e));
+        for (int x = 0; x < e; ++x) {
+            const auto* gu = static_cast<const std::byte*>(gate_up.qdata) +
+                             std::int64_t(x) * 2 * width * p.gate_up_row_bytes;
+            table[x]         = gu;
+            table[e + x]     = gu + std::int64_t(width) * p.gate_up_row_bytes;
+            table[2 * e + x] = gu;
+            table[3 * e + x] = static_cast<const std::byte*>(down.qdata) +
+                               std::int64_t(x) * hidden * p.down_row_bytes;
+        }
+        p.tables = DeviceBuffer(table.size() * sizeof(void*));
+        p.tables.copy_from_host(table.data(), table.size() * sizeof(void*));
+    }
+
+    // The drafter's blocks with their rings (and checkpoints), its tables and its buffers.
+    void plan_drafter(std::size_t ring_bytes, std::size_t& branch_bytes) {
+        const DSparkConfig& dc = *model.dspark_config();
+        const DSparkWeights& dw = *model.dspark();
+        Drafter& d              = drafter.emplace();
+        d.targets               = int(dc.target_layers.size());
+        d.block                 = int(dc.block_size);
+        d.noise                 = dc.noise_token;
+        d.domain                = int(model.resources().public_token_count);
+        d.target_of.assign(config.num_hidden_layers, -1);
+        for (int j = 0; j < d.targets; ++j) { d.target_of[dc.target_layers[std::size_t(j)]] = j; }
+        if (d.block < 1 || std::uint32_t(d.block) > std::uint32_t(gguf::kMaxVectorColumns) ||
+            d.domain <= 0 || d.domain > vocab) {
+            throw std::invalid_argument("DeepSeek-V4.1: the DSpark block must be 1..8 rows over the vocabulary");
+        }
+        d.fc         = matrix(model, dw.fc);
+        d.tap_norm   = fp32(model, dw.tap_norm, hidden);
+        d.final_norm = fp32(model, dw.final_norm, hidden);
+        d.confidence = fp32(model, dw.confidence, std::int64_t(hidden) + kernels::kMarkovRank);
+        d.markov_embed = bf16_table(model, dw.markov_embed, vocab, kernels::kMarkovRank);
+        d.markov_head  = bf16_table(model, dw.markov_head, vocab, kernels::kMarkovRank);
+        const int sequences = int(options.sequences);
+        for (const LayerWeights& lw : dw.layers) {
+            LayerPlan p = plan_block(lw, 0, int(dc.experts), int(dc.top_k));
+            plan_resident(p, lw.moe);
+            // The seed's kv rows: of [query_a; kv] when the two are one parent.
+            Weight kv = p.query_kv.back();
+            if (p.query_kv.size() == 1) {
+                kv.qdata = static_cast<const std::byte*>(kv.qdata) + std::int64_t(query_rank) * row_bytes(kv);
+                kv.n     = kLatent;
+            }
+            d.kv.push_back(kv);
+            p.ring = DeviceBuffer(ring_bytes * sequences);
+            p.ring.fill(0);
+            kv_bytes += p.ring.bytes;
+            branch_bytes += ring_bytes;
+            if (options.checkpoints) {
+                p.checkpoint_ring = DeviceBuffer(ring_bytes * sequences);
+                kv_bytes += p.checkpoint_ring.bytes;
+            }
+            d.layers.push_back(std::move(p));
+        }
+        d.taps    = DeviceBuffer(std::size_t(window) * d.targets * hidden * 4);
+        d.ids     = DeviceBuffer(std::size_t(d.block + 1) * 4);
+        d.values  = DeviceBuffer(std::size_t(d.block) * 4);
+        d.scratch = DeviceBuffer(kernels::markov_scratch_bytes());
+        d.host    = std::make_unique<PinnedHostBuffer>(std::size_t(2 * d.block) * 4);
+        d.copied  = std::make_unique<CudaCompletionEvent>(device);
+        kv_bytes += d.taps.bytes;
+    }
+
+    // A whole-layer bank of the routed experts, each blob at its largest aligned size.
+    [[nodiscard]] std::uint64_t bank_bytes() const {
         std::vector<std::uint64_t> sizes;
         for (const auto& bank : model.expert_banks()) {
-            sources.push_back(bank.delivery);
             for (const auto& expert : bank.delivery.experts) {
                 sizes.resize(std::max(sizes.size(), expert.size()), 0);
                 for (std::size_t b = 0; b < expert.size(); ++b) {
@@ -499,13 +689,22 @@ struct Executor::Impl {
                 }
             }
         }
-        // One whole-layer bank at least (the transport adds a second where memory allows).
         std::uint64_t slot = 0;
         for (auto bytes : sizes) { slot += bytes; }
-        const auto bank     = slot * config.num_experts;
-        const auto metadata = std::uint64_t(options.prefill_chunk) * config.top_k_experts * 8 +
-            std::uint64_t(config.num_hidden_layers) * config.num_experts * 4 * sizeof(void*) +
-            config.num_experts * 4;
+        return slot * config.num_experts;
+    }
+    [[nodiscard]] std::uint64_t delivery_metadata() const {
+        return std::uint64_t(options.prefill_chunk) * config.top_k_experts * 8 +
+               std::uint64_t(config.num_hidden_layers) * config.num_experts * 4 * sizeof(void*) +
+               config.num_experts * 4;
+    }
+
+    void plan_delivery() {
+        std::vector<ExpertDeliveryLayer> sources;
+        for (const auto& bank : model.expert_banks()) { sources.push_back(bank.delivery); }
+        // One whole-layer bank at least (the transport adds a second where memory allows).
+        const auto bank     = bank_bytes();
+        const auto metadata = delivery_metadata();
         std::size_t free = 0, total = 0;
         CUDA_CHECK(cudaMemGetInfo(&free, &total));
         const auto cache = options.expert_cache_bytes.value_or(0);
@@ -520,6 +719,33 @@ struct Executor::Impl {
         transport.cache_bytes     = options.expert_cache_bytes;
         transport.keep_free_bytes = kGraphReserve + (growing ? kKvHeadroom : 0);
         transport.elastic         = growing;
+        const float dma_share     = options.expert_dma_share.value_or(0.0F);
+        if (!(dma_share >= 0 && dma_share <= 1) || options.expert_cpu_threads > 256) {
+            throw std::invalid_argument("DeepSeek-V4.1: the DMA share must be 0..1 and CPU threads 0..256");
+        }
+        std::vector<CpuExpertLayer> cpu_layers;
+        bool computes = false;
+        for (const auto& b : model.expert_banks()) {
+            cpu_layers.push_back({b.gate_up_type, b.down_type, std::int64_t(b.gate_up_row_bytes),
+                                  std::int64_t(b.down_row_bytes)});
+            computes = computes || CpuExperts::computes(cpu_layers.back(), hidden, width);
+        }
+        // A disk expert the CPU computes needs the same file read as a copied one; on an RTX 4090
+        // host every split of disk experts decoded slower than copying every miss, so the CPU
+        // computes disk experts only at an explicit share.
+        const bool cpu_share = options.expert_dma_share
+                                   ? dma_share < 1
+                                   : model.expert_residency() == ExpertResidency::Host;
+        if (computes && cpu_share) {
+            cpu_experts = std::make_unique<CpuExperts>(std::move(cpu_layers), hidden, width,
+                int(config.top_k_experts), config.swiglu_limit);
+            transport.cpu.products      = cpu_experts.get();
+            transport.cpu.input_bytes   = cpu_experts->input_bytes();
+            transport.cpu.product_bytes = cpu_experts->product_bytes();
+            transport.cpu.share         = 1.0 - double(dma_share);
+            transport.cpu.balance       = !options.expert_dma_share;
+            transport.cpu.threads       = options.expert_cpu_threads;
+        }
         delivery = std::make_unique<ExpertDelivery>(device.rank(0), model.expert_files(),
                                                     std::move(sources), transport);
     }
@@ -529,6 +755,38 @@ struct Executor::Impl {
 
     std::size_t start_reserve() const {
         return options.prefill_chunk >= 2048 ? std::size_t(2048) << 20 : std::size_t(768) << 20;
+    }
+
+    // Rows the staging buffers hold: a prompt step's tokens or one row per sequence.
+    [[nodiscard]] std::size_t staging_rows() const {
+        return std::max<std::size_t>(std::max(options.prefill_chunk, span_tokens), options.sequences);
+    }
+
+    // The tokens of a prompt span (0: spans off): with host or disk experts on this device, the
+    // most chunks (kSpanChunks, 4 or 2, within max_context) whose span buffers (in the workspace,
+    // or borrowed from an elastic cache for each span) and staging take no more than the memory
+    // the expert cache would get beside two layer banks, and at most an eighth of that memory and
+    // the banks together, so the cache keeps most of its slots while a span runs.
+    [[nodiscard]] std::uint32_t plan_span() const {
+        if (model.expert_banks().empty()) { return 0; }
+        const std::uint64_t chunk = plan_workspace(0), bank = bank_bytes();
+        std::size_t free = 0, total = 0;
+        CUDA_CHECK(cudaMemGetInfo(&free, &total));
+        const std::uint64_t fixed = chunk + kGraphReserve + unbacked() + (growing ? kKvHeadroom : 0) +
+                                    delivery_metadata() + options.expert_cache_bytes.value_or(0);
+        if (free <= fixed + 2 * bank) { return 0; }
+        const std::uint64_t room = free - fixed - 2 * bank;
+        const std::uint64_t row  = 12 + (options.engram_table ? std::uint64_t(hasher.rows_per_token()) *
+                                                                    kEngramRowBytes : 0);
+        for (std::uint32_t chunks = kSpanChunks; chunks >= 2; chunks /= 2) {
+            const auto tokens = std::uint32_t(std::min<std::uint64_t>(
+                options.max_context, std::uint64_t(chunks) * options.prefill_chunk));
+            if (tokens <= options.prefill_chunk) { continue; }
+            const std::uint64_t extra =
+                plan_workspace(tokens) - chunk + std::uint64_t(tokens - options.prefill_chunk) * row;
+            if (extra <= room && 8 * extra <= room + 2 * bank) { return tokens; }
+        }
+        return 0;
     }
 
     // ---- Growing caches -------------------------------------------------------------------------
@@ -615,6 +873,33 @@ struct Executor::Impl {
         count_backed();
     }
 
+    // Beside an elastic expert cache, before a span of `n` tokens: its span_buffers, the cache
+    // giving memory back when the device keeps less than them and the CUDA Graph reserve. Empty
+    // when the cache has no more to give. Outside capture.
+    DeviceBuffer borrow_span(std::uint32_t n) {
+        const std::size_t bytes = span_buffers(n), need = bytes + kGraphReserve;
+        std::size_t free = 0, total = 0;
+        CUDA_CHECK(cudaMemGetInfo(&free, &total));
+        while (free < need) {
+            if (delivery->shrink_cache(std::max(need - free, std::size_t(64) << 20)) == 0) { return {}; }
+            CUDA_CHECK(cudaMemGetInfo(&free, &total));
+        }
+        try {
+            return DeviceBuffer(bytes);
+        } catch (const std::runtime_error&) {
+            (void)cudaGetLastError(); // the failed allocation's error
+            return {};
+        }
+    }
+
+    // After the span: its buffers back to the expert cache, once the span's work is done.
+    void give_back(DeviceBuffer& borrowed) {
+        if (!borrowed.p) { return; }
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        borrowed = DeviceBuffer();
+        delivery->grow_cache();
+    }
+
     void release(std::uint32_t sequence) {
         if (!growing || sequence_areas.empty() || sequence_areas.front()->backed[sequence] == 0) { return; }
         CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -638,8 +923,19 @@ struct Executor::Impl {
                              int(options.sequences) * (int(options.draft_tokens) + 1));
     }
 
-    std::size_t plan_workspace() const {
-        const std::size_t t = options.prefill_chunk, h = hidden, s = streams;
+    // A span of `n` tokens' residual streams, both coefficient sites and index selections, as
+    // forward_span allocates them.
+    [[nodiscard]] std::size_t span_buffers(std::size_t n) const {
+        const std::size_t s = streams, site = (2 * s + s * s) * 4;
+        return round_up(n * s * hidden * 4, kAlign) + 2 * round_up(n * site, kAlign) +
+               round_up(n * std::size_t(index_topk) * 4, kAlign) +
+               (candidate_words > 0 ? round_up(n * std::size_t(candidate_words) * 4, kAlign) : 0);
+    }
+
+    // The workspace of a prompt chunk's pass, and with `span` tokens a span's residual streams,
+    // coefficients and index selections beside one chunk's temporaries.
+    std::size_t plan_workspace(std::uint32_t span) const {
+        const std::size_t t = options.prefill_chunk, n = span, h = hidden, s = streams;
         const std::size_t latent_rows = std::size_t(heads) * kLatent;
         const std::size_t pairs = t * top_k, w = width;
         std::size_t gguf_scratch = 0;
@@ -648,7 +944,7 @@ struct Executor::Impl {
             gguf_scratch = std::max(gguf_scratch,
                                     ops::detail::gguf_project_workspace_bytes({&shape, 1}, 1, int(t)));
         };
-        for (const LayerPlan& p : layers) {
+        const auto block_products = [&](const LayerPlan& p) {
             for (const Weight& m : p.query_kv) { product(m); }
             for (const Weight& m : p.shared_gate_up) { product(m); }
             Weight group = p.output_a;
@@ -657,6 +953,11 @@ struct Executor::Impl {
                 product(*m);
             }
             if (p.engram >= 0) { product(p.engram_projection); }
+        };
+        for (const LayerPlan& p : layers) { block_products(p); }
+        if (drafter) {
+            for (const LayerPlan& p : drafter->layers) { block_products(p); }
+            product(drafter->fc);
         }
         {
             Weight rows = head;
@@ -675,23 +976,23 @@ struct Executor::Impl {
             return bytes;
         };
         const std::size_t mixes = config.hc_mixes();
-        const std::size_t pass = sum({t * s * h * 4, 2 * t * (2 * s + s * s) * 4, t * mixes * 4,
-                                      t * std::size_t(index_topk) * 4, t * std::size_t(candidate_words) * 4});
+        const std::size_t sites = 2 * (2 * s + s * s) * 4;
+        std::size_t pass = sum({t * s * h * 4, t * sites, t * mixes * 4, t * std::size_t(index_topk) * 4,
+                                t * std::size_t(candidate_words) * 4});
+        if (n > t) { pass = std::max(pass, span_buffers(n) + sum({t * mixes * 4})); }
         const std::size_t columns = std::size_t(config.engram.columns()) * config.engram.head_dim;
         const std::size_t engram_bytes = sum({t * columns * 2, t * 4, t * (s + 1) * h * 4});
         const std::size_t decode_width = std::size_t(decode_rows()) * std::size_t(capacity_rows) * 4;
         const std::size_t scores = std::max(kScoreBudget, decode_width);
-        std::size_t partial = 0;
-        for (int b = 1; b <= decode_rows(); ++b) {
-            partial = std::max(partial, kernels::sparse_attention_workspace_floats(
-                                            b, heads, decode_splits[std::size_t(b)]) * 4);
-        }
+        const std::size_t partial =
+            kernels::sparse_attention_workspace_floats(decode_rows(), heads, decode_splits) * 4;
         const std::size_t attention = sum({
             t * h * 2, t * h * 4, t * 1792 * 4, t * std::size_t(query_rank) * 2,
             t * std::size_t(query_rank) * 4, t * 4, t * 4, 8 * t * 4,
             t * latent_rows * 2, t * latent_rows * 2,
             t * std::size_t(groups) * output_rank * 4, t * std::size_t(groups) * output_rank * 2,
-            t * h * 4,
+            gguf::vector_activation_bytes(heads / groups * kLatent, groups * gguf::kMaxVectorColumns),
+            std::size_t(groups) * gguf::kMaxVectorColumns * 4, t * h * 4,
             // compressor
             t * kLatent * 4, t * kLatent * 4, t * kLatent * 4, t * kIndexDim * 4,
             // indexer
@@ -707,11 +1008,30 @@ struct Executor::Impl {
                      gguf::vector_activation_bytes(int(w), int(pairs))),
             pairs * h * 4, t * h * 8, t * 2 * w * 4, t * w * 2});
         const std::size_t head_bytes = sum({t * h * 2, std::size_t(kHeadRows) * vocab * 4, kHeadRows * 4});
-        return pass + std::max({engram_bytes, attention, ffn, head_bytes}) + gguf_scratch +
+        // A seed of the drafter's rings from a pass's last rows (at most a window of them).
+        std::size_t seed_bytes = 0;
+        if (drafter) {
+            const std::size_t r = std::min<std::size_t>(window, std::max<std::size_t>(t, n));
+            seed_bytes = sum({r * std::size_t(drafter->targets) * h * 2, r * h * 4, r * h * 2,
+                              r * drafter->layers.size() * kLatent * 4, r * 4});
+        }
+        return pass + std::max({engram_bytes, attention, ffn, head_bytes}) + seed_bytes + gguf_scratch +
                allocations * kAlign + (32u << 20);
     }
 
     // ---- Shared pieces ---------------------------------------------------------------------------
+
+    // A call of t <= kMaxVectorColumns tokens through the grouped output projection: group g of
+    // token j is pair j * groups + g, the groups the experts.
+    [[nodiscard]] gguf::MoeRouting group_routing(int t) const {
+        const auto* base = static_cast<const std::int32_t*>(group_routes.p) + group_routes_at.at(std::size_t(t));
+        gguf::MoeRouting routing;
+        routing.bounds       = base;
+        routing.sorted       = base + groups + 1;
+        routing.active       = routing.sorted + std::int64_t(groups) * t;
+        routing.active_count = routing.active + groups;
+        return routing;
+    }
 
     template <typename T>
     T* alloc(std::size_t count) {
@@ -770,12 +1090,34 @@ struct Executor::Impl {
         }
     }
 
+    void encode_image(std::span<const std::uint16_t> patches, int grid_w, int grid_h,
+                      std::span<std::uint16_t> rows) {
+        if (!tower) { throw std::invalid_argument("deepseek_v41 encode_image: no vision tower"); }
+        const VisionConfig& vc = tower->config();
+        const std::size_t span =
+            VisionConfig::span_tokens(tower->aligner_rows(grid_h), tower->aligner_columns(grid_w));
+        if (grid_w <= 0 || grid_h <= 0 ||
+            std::uint64_t(grid_w) * std::uint64_t(grid_h) > options.vision_max_patches ||
+            patches.size() != std::size_t(grid_w) * grid_h * vc.patch_features() ||
+            span > vc.max_image_tokens || rows.size() != span * std::size_t(hidden)) {
+            throw std::invalid_argument("deepseek_v41 encode_image: invalid image");
+        }
+        CUDA_CHECK(cudaMemcpyAsync(d_patches.p, patches.data(), patches.size() * 2,
+                                   cudaMemcpyHostToDevice, stream));
+        workspace->reset();
+        tower->encode(static_cast<const __nv_bfloat16*>(d_patches.p), grid_w, grid_h,
+                      static_cast<__nv_bfloat16*>(d_image_rows.p), *workspace, stream);
+        CUDA_CHECK(cudaMemcpyAsync(rows.data(), d_image_rows.p, rows.size() * 2,
+                                   cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
+
     // Tokens, positions, and when given sequences, to the device.
     void stage(std::span<const std::int32_t> a, std::span<const std::int32_t> b,
                std::span<const std::int32_t> c) {
         staged->synchronize();
         auto* host = static_cast<std::int32_t*>(h_staging->data());
-        const std::size_t rows = std::max<std::size_t>(options.prefill_chunk, options.sequences);
+        const std::size_t rows = staging_rows();
         if (a.size() > rows || b.size() > rows || c.size() > rows) {
             throw std::invalid_argument("deepseek_v41 executor: staging overflow");
         }
@@ -797,7 +1139,8 @@ struct Executor::Impl {
     // The table rows of a pass's rows to the device, block-major: rows[r] is (sequence, token)
     // after the sequence's `history` (advanced when `advance`).
     void read_engram(std::span<const std::int32_t> tokens, std::span<const std::uint32_t> owners,
-                     std::span<EngramHasher::History> history_of, bool advance) {
+                     std::span<EngramHasher::History> history_of, bool advance,
+                     std::span<const std::uint8_t> dead = {}) {
         if (!engram) { return; }
         const std::size_t t = tokens.size();
         const std::uint32_t per = hasher.rows_per_token(), columns = hasher.columns();
@@ -807,7 +1150,7 @@ struct Executor::Impl {
             std::size_t end = r + 1;
             while (end < t && owners[end] == owners[r]) { ++end; }
             hasher.rows(history_of[r], tokens.subspan(r, end - r), engram_scratch.data() + r * per,
-                        advance);
+                        advance, dead.empty() ? dead : dead.subspan(r, end - r));
             r = end;
         }
         engram_copied->synchronize();
@@ -825,9 +1168,12 @@ struct Executor::Impl {
         engram_copied->record(stream);
     }
 
-    void advance_history(std::uint32_t sequence, std::span<const std::int32_t> tokens) {
-        for (const std::int32_t token : tokens) {
-            histories[sequence].push(hasher.compressed(token), hasher.hash().ngram_size - 1);
+    void advance_history(std::uint32_t sequence, std::span<const std::int32_t> tokens,
+                         std::span<const std::uint8_t> dead = {}) {
+        for (std::size_t i = 0; i < tokens.size(); ++i) {
+            histories[sequence].push(!dead.empty() && dead[i] ? EngramHasher::kDead
+                                                              : hasher.compressed(tokens[i]),
+                                     hasher.hash().ngram_size - 1);
         }
     }
 
@@ -838,6 +1184,16 @@ struct Executor::Impl {
                               row_bytes(embedding), hidden,
                               static_cast<const std::int32_t*>(d_tokens.p), t, h,
                               std::int64_t(streams) * hidden, stream);
+        // The step's image rows replace their embeddings, a piece at a time through the device
+        // rows (each copy ordered after the placement before it).
+        const std::int64_t stride = std::int64_t(streams) * hidden;
+        for (const ImageRows& piece : step_images) {
+            const int count = int(piece.embeddings.size() / std::size_t(hidden));
+            CUDA_CHECK(cudaMemcpyAsync(d_image_rows.p, piece.embeddings.data(),
+                                       piece.embeddings.size() * 2, cudaMemcpyHostToDevice, stream));
+            kernels::place_rows(static_cast<const __nv_bfloat16*>(d_image_rows.p), count, hidden,
+                                h + std::int64_t(piece.row) * stride, stride, stream);
+        }
         kernels::expand_streams(h, t, streams, hidden, stream);
     }
 
@@ -865,26 +1221,28 @@ struct Executor::Impl {
         kernels::hc_split(a, stream);
     }
 
-    void engram_block(const LayerPlan& p, float* h, int t) {
+    void engram_block(const LayerPlan& p, float* h, int t, const Pass& s) {
         if (!engram) { return; }
         auto scope        = workspace->scope();
         const int columns = int(hasher.columns());
         const int rows    = t * columns;
+        const std::size_t block = std::size_t(s.staged ? s.staged : t) * columns;
         Tensor e          = alloc_bf16(columns * int(config.engram.head_dim), t);
         kernels::engram_rows(static_cast<const std::uint8_t*>(d_engram.p) +
-                                 std::size_t(p.engram) * rows * kEngramRowBytes,
+                                 (std::size_t(p.engram) * block + std::size_t(s.row) * columns) *
+                                     kEngramRowBytes,
                              rows, static_cast<__nv_bfloat16*>(e.data), stream);
         const int kv_rows = (streams + 1) * hidden;
         auto* kv          = alloc<float>(std::size_t(t) * kv_rows);
         project(e, p.engram_projection, kv, kv_rows);
-        kernels::engram_gate(h, kv, p.engram_gate, t, streams, hidden, eps, stream);
+        kernels::engram_gate(h, kv, p.engram_gate, t, streams, hidden, eps, stream, image_mask);
     }
 
     // The block's attention: its output y added to the streams through `post` and `comb`.
     void attention(const LayerPlan& p, float* h, const float* pre, int t, const Pass& s,
                    std::int32_t* topk, std::uint32_t* candidates, const Coefficients& c) {
         auto scope      = workspace->scope();
-        const auto* pos = static_cast<const std::int32_t*>(d_positions.p);
+        const auto* pos = static_cast<const std::int32_t*>(d_positions.p) + s.row;
         const auto* seq = s.chunk ? nullptr : static_cast<const std::int32_t*>(d_sequences.p);
         Tensor x        = alloc_bf16(hidden, t);
         auto* x32       = alloc<float>(std::size_t(t) * hidden);
@@ -938,16 +1296,16 @@ struct Executor::Impl {
         a.q                 = static_cast<const __nv_bfloat16*>(q.data);
         a.tokens            = t;
         a.heads             = heads;
-        a.positions         = pos;
+        a.positions         = s.visible != nullptr ? s.visible : pos;
         a.sequences         = seq;
         a.sequence          = int(s.sequence);
         a.window            = s.chunk ? stage_ring : ring;
         a.window_seq_stride = s.chunk ? 0 : ring_stride;
         a.ring              = s.chunk ? prefill_ring : kRing;
-        a.window_size       = window;
+        a.window_size       = window + s.extra_window;
         a.sinks             = p.sinks;
         a.scale             = 1.0f / std::sqrt(float(kLatent));
-        a.splits            = s.chunk ? 1 : decode_splits[std::size_t(t)];
+        a.splits            = s.chunk ? 1 : decode_splits;
         if (a.splits > 1) {
             a.partial = alloc<float>(kernels::sparse_attention_workspace_floats(t, heads, a.splits));
         }
@@ -959,14 +1317,40 @@ struct Executor::Impl {
                                stream);
         }
         // The grouped output projection: group g's heads (rounded as the reference rounds them)
-        // through rows [g * o_rank, (g + 1) * o_rank) of output_a, into the latent's rows there.
-        auto* grouped = static_cast<__nv_bfloat16*>(q.data); // q is spent
+        // through rows [g * o_rank, (g + 1) * o_rank) of output_a, into the latent's rows there. A
+        // decode or verification call runs the groups as the experts of one vector product, its
+        // pairs token by token (group_routing), so one guard, quantization, product and unscale
+        // serve every group: each pair's arithmetic is that of its group's own product, whose eight
+        // launches of 1,024 rows read output_a at about 470 GB/s on an RTX 4090.
+        auto* grouped         = static_cast<__nv_bfloat16*>(q.data); // q is spent
+        const bool vector     = t <= gguf::kMaxVectorColumns;
         kernels::attention_output(static_cast<const __nv_bfloat16*>(o.data), t, heads, groups, pos,
-                                  p.freq, grouped, stream);
+                                  p.freq, vector, grouped, stream);
         const int latent_rows = groups * output_rank;
         const int group_k     = heads / groups * kLatent;
         auto* latent          = alloc<float>(std::size_t(t) * latent_rows);
-        for (int g = 0; g < groups; ++g) {
+        if (vector) {
+            const int pairs = t * groups;
+            const auto type = ops::detail::gguf_type(p.output_a.qtype);
+            float* scale    = nullptr;
+            if (gguf::vector_activation_f16_sums(type)) {
+                scale = alloc<float>(pairs);
+                kernels::guard_columns(grouped, group_k, pairs, scale, stream);
+            }
+            void* act = workspace->alloc_bytes(gguf::vector_activation_bytes(group_k, pairs)).data;
+            gguf::quantize_vector_activation(grouped, group_k, pairs, nullptr, act, stream);
+            const gguf::MoeTable table{static_cast<const void* const*>(p.output_groups.p),
+                                       row_bytes(p.output_a), output_rank, group_k};
+            gguf::MoeOutput out;
+            out.f32         = latent;
+            const int chunk = t <= 1 ? 1 : t <= 2 ? 2 : t <= 4 ? 4 : 8;
+            gguf::moe_vector_product(type, table, group_routing(t), groups, 1, 1, act, pairs, out,
+                                     chunk, stream);
+            if (scale != nullptr) {
+                kernels::unscale_columns(latent, output_rank, output_rank, pairs, scale, stream);
+            }
+        }
+        for (int g = 0; g < groups && !vector; ++g) {
             Weight part = p.output_a;
             part.qdata  = static_cast<const std::byte*>(p.output_a.qdata) +
                          std::int64_t(g) * output_rank * row_bytes(p.output_a);
@@ -986,7 +1370,7 @@ struct Executor::Impl {
     // indexer keys, into its caches.
     void compress_block(const LayerPlan& p, const float* x32, int t, const Pass& s) {
         auto scope      = workspace->scope();
-        const auto* pos = static_cast<const std::int32_t*>(d_positions.p);
+        const auto* pos = static_cast<const std::int32_t*>(d_positions.p) + s.row;
         const auto* seq = s.chunk ? nullptr : static_cast<const std::int32_t*>(d_sequences.p);
         auto* kv        = alloc<float>(std::size_t(t) * kLatent);
         kernels::gemm_f32(kLatent, t, hidden, p.compressor_kv, x32, kv, stream);
@@ -1040,7 +1424,7 @@ struct Executor::Impl {
                      const float* x32, int t, const Pass& s, std::int32_t* topk,
                      std::uint32_t* candidates) {
         auto scope      = workspace->scope();
-        const auto* pos = static_cast<const std::int32_t*>(d_positions.p);
+        const auto* pos = static_cast<const std::int32_t*>(d_positions.p) + s.row;
         const auto* seq = s.chunk ? nullptr : static_cast<const std::int32_t*>(d_sequences.p);
         const int q_rows = index_heads * kIndexDim;
         auto* q32        = alloc<float>(std::size_t(t) * q_rows);
@@ -1132,37 +1516,50 @@ struct Executor::Impl {
     template <typename Shared>
     void routed(const LayerPlan& p, const Tensor& x, const float* scale, const float* x32, int t,
                 float* y, Shared&& shared) {
-        const int e = experts, k = top_k, w = width, pairs = t * k;
+        const int e = p.experts, k = p.top_k, w = width, pairs = t * k;
         auto* logits = alloc<float>(std::size_t(t) * e);
         kernels::gemm_f32(e, t, hidden, p.router, x32, logits, stream);
         auto* ids     = alloc<std::int32_t>(pairs);
         auto* weights = alloc<float>(pairs);
         kernels::route(logits, p.router_bias, t, e, k, config.routed_scaling_factor, ids, weights,
-                       stream);
+                       stream, p.image_bias, p.image_bias != nullptr ? image_mask : nullptr);
         void* routing_space = workspace->alloc_bytes(gguf::moe_routing_bytes(e, pairs)).data;
         const gguf::MoeRouting routing = gguf::moe_sort_routes(ids, pairs, e, routing_space, stream);
-        std::optional<ExpertDelivery::Call> call;
-        if (delivery) {
-            call = delivery->begin(std::size_t(p.delivery_layer), ids, std::uint32_t(pairs), stream);
+        const auto* xb   = static_cast<const __nv_bfloat16*>(x.data);
+        const bool vector = t <= gguf::kMaxVectorColumns;
+        void* xq          = nullptr; // the vector kernels' activation of x
+        if (vector) {
+            xq = workspace->alloc_bytes(gguf::vector_activation_bytes(hidden, t)).data;
+            gguf::quantize_vector_activation(xb, hidden, t, nullptr, xq, stream);
         }
-        const auto* tables = delivery ? delivery->tables(std::size_t(p.delivery_layer))
-                                      : static_cast<const void* const*>(p.tables.p);
+        // A decode or verification call may leave misses to the CPU, which reads the quantized
+        // activation, the route weights and the guard's factors.
+        const bool cpu = cpu_experts && vector && t <= CpuExperts::kMaxTokens;
+        std::optional<ExpertDelivery::Call> call;
+        if (p.delivery_layer >= 0) {
+            const std::array<ExpertDelivery::Input, 3> inputs{
+                ExpertDelivery::Input{xq, cpu ? cpu_experts->activation_bytes(t) : 0},
+                ExpertDelivery::Input{weights, cpu ? cpu_experts->weight_bytes(t) : 0},
+                ExpertDelivery::Input{scale, cpu ? CpuExperts::scale_bytes(t) : 0}};
+            call = delivery->begin(std::size_t(p.delivery_layer), ids, std::uint32_t(pairs), stream,
+                                   cpu ? std::span<const ExpertDelivery::Input>(inputs)
+                                       : std::span<const ExpertDelivery::Input>());
+        }
+        const auto* tables = p.delivery_layer >= 0 ? delivery->tables(std::size_t(p.delivery_layer))
+                                                   : static_cast<const void* const*>(p.tables.p);
         const gguf::MoeTable gate_up{tables + 2 * e, p.gate_up_row_bytes, 2 * w, hidden};
         const gguf::MoeTable down{tables + 3 * e, p.down_row_bytes, hidden, w};
         const int max_active = std::min(pairs, e);
-        const auto* xb       = static_cast<const __nv_bfloat16*>(x.data);
         auto* gu             = alloc<float>(std::size_t(pairs) * 2 * w);
         auto* middle         = alloc<__nv_bfloat16>(std::size_t(pairs) * w);
         kernels::MoeCombineArgs combine;
         combine.y      = y;
         combine.tokens = t;
         combine.hidden = hidden;
-        if (t <= gguf::kMaxVectorColumns) {
+        if (vector) {
             const int chunk = t <= 1 ? 1 : t <= 2 ? 2 : t <= 4 ? 4 : 8;
-            void* act  = workspace->alloc_bytes(gguf::vector_activation_bytes(hidden, t)).data;
             void* act2 = workspace->alloc_bytes(gguf::vector_activation_bytes(w, pairs)).data;
             auto* fixed = alloc<unsigned long long>(std::size_t(t) * hidden);
-            gguf::quantize_vector_activation(xb, hidden, t, nullptr, act, stream);
             CUDA_CHECK(cudaMemsetAsync(fixed, 0, std::size_t(t) * hidden * 8, stream));
             CUDA_CHECK(cudaMemsetAsync(gu, 0, std::size_t(pairs) * 2 * w * 4, stream));
             gguf::MoeOutput rows;
@@ -1171,7 +1568,7 @@ struct Executor::Impl {
             out.weighted = fixed;
             out.weights  = weights;
             const auto compute = [&](const gguf::MoeRouting& part) {
-                gguf::moe_vector_product(p.gate_up_type, gate_up, part, max_active, k, k, act, t,
+                gguf::moe_vector_product(p.gate_up_type, gate_up, part, max_active, k, k, xq, t,
                                          rows, chunk, stream);
                 kernels::clamped_swiglu(gu, 2 * w, pairs, w, config.swiglu_limit, scale, k, middle,
                                         w, stream);
@@ -1194,6 +1591,9 @@ struct Executor::Impl {
                 shared();
                 delivery->await(stream);
                 compute(stage(call->missing_experts));
+                if (call->cpu != nullptr) {
+                    kernels::add_fixed(fixed, call->products, call->cpu, std::int64_t(t) * hidden, stream);
+                }
             } else {
                 compute(routing);
                 shared();
@@ -1203,7 +1603,7 @@ struct Executor::Impl {
             return;
         }
         shared();
-        if (delivery) { delivery->await(stream); }
+        if (call) { delivery->await(stream); }
         if (gguf::moe_matrix_supported(p.gate_up_type, 2 * w, hidden, true)) {
             void* act = workspace->alloc_bytes(gguf::moe_matrix_activation_bytes(hidden, pairs)).data;
             gguf::quantize_moe_matrix_activation(p.gate_up_type, xb, hidden, routing, pairs, k, act,
@@ -1257,10 +1657,139 @@ struct Executor::Impl {
         }
     }
 
+    // ---- The DSpark drafter -----------------------------------------------------------------------
+
+    // The streams' mean of `n` rows of h entering backbone block l, when the drafter taps it, into
+    // the taps from row `at`.
+    void tap(std::size_t l, const float* rows, int n, int at) {
+        const int j = drafter->target_of[l];
+        if (j < 0 || n <= 0) { return; }
+        kernels::stream_mean(rows, n, streams, hidden,
+                             static_cast<float*>(drafter->taps.p) +
+                                 (std::size_t(at) * drafter->targets + std::size_t(j)) * hidden,
+                             std::int64_t(drafter->targets) * hidden, stream);
+    }
+
+    // The drafter's ring rows of `n` taps from row `at`: the taps through the projection and its
+    // norm, then each block's kv of that, normed, turned and rounded as the window latents are, at
+    // positions pos of `sequence` (of seq[r] each when given).
+    void seed(int n, int at, const std::int32_t* pos, const std::int32_t* seq, std::uint32_t sequence) {
+        Drafter& d       = *drafter;
+        auto scope       = workspace->scope();
+        const int inputs = d.targets * hidden;
+        Tensor x         = alloc_bf16(inputs, n);
+        kernels::f32_to_bf16(static_cast<const float*>(d.taps.p) + std::size_t(at) * inputs,
+                             static_cast<__nv_bfloat16*>(x.data), std::int64_t(n) * inputs, stream);
+        auto* main = alloc<float>(std::size_t(n) * hidden);
+        project(x, d.fc, main, hidden);
+        Tensor normed = alloc_bf16(hidden, n);
+        kernels::rms_rows(main, hidden, hidden, n, d.tap_norm, eps,
+                          static_cast<__nv_bfloat16*>(normed.data), nullptr, stream);
+        const int kv_rows = int(d.kv.size()) * kLatent;
+        auto* kv          = alloc<float>(std::size_t(n) * kv_rows);
+        project(normed, d.kv, kv, kv_rows);
+        for (std::size_t b = 0; b < d.layers.size(); ++b) {
+            const LayerPlan& p = d.layers[b];
+            kernels::KvPostArgs a;
+            a.kv         = kv + b * kLatent;
+            a.kv_stride  = kv_rows;
+            a.tokens     = n;
+            a.norm       = p.kv_norm;
+            a.eps        = eps;
+            a.positions  = pos;
+            a.freq       = p.freq;
+            a.cache      = static_cast<__nv_bfloat16*>(p.ring.p);
+            a.seq_stride = std::int64_t(kRing) * kLatent;
+            a.sequences  = seq;
+            a.sequence   = int(sequence);
+            a.ring       = kRing;
+            kernels::kv_post(a, stream);
+        }
+    }
+
+    // The drafter's block over staged rows (the anchor, then the noise token, at the sequence's
+    // next positions; then each row's visible position, the block's last): its blocks, the head
+    // over the final norm of the collapsed streams, the Markov chain's greedy drafts and their
+    // confidences, copied to the pinned buffer.
+    void draft_pass(int b) {
+        Drafter& d = *drafter;
+        workspace->reset();
+        auto scope     = workspace->scope();
+        auto* h        = alloc<float>(std::size_t(b) * streams * hidden);
+        embed(b, h);
+        const int site = 2 * streams + streams * streams;
+        Coefficients attention_site, ffn_site;
+        for (Coefficients* c : {&attention_site, &ffn_site}) {
+            auto* base = alloc<float>(std::size_t(b) * site);
+            c->pre     = base;
+            c->post    = base + std::size_t(b) * streams;
+            c->comb    = base + std::size_t(b) * 2 * streams;
+        }
+        auto* mix_scratch = alloc<float>(std::size_t(b) * config.hc_mixes());
+        Pass s;
+        s.t              = b;
+        s.visible        = static_cast<const std::int32_t*>(d_positions.p) + b;
+        s.extra_window   = b;
+        const float* pre = nullptr;
+        for (const LayerPlan& p : d.layers) {
+            mixes(p.hc_attention, h, b, mix_scratch, attention_site);
+            attention(p, h, pre, b, s, nullptr, nullptr, attention_site);
+            mixes(p.hc_ffn, h, b, mix_scratch, ffn_site);
+            ffn(p, h, attention_site.pre, b, ffn_site);
+            pre = ffn_site.pre;
+        }
+        Tensor x = alloc_bf16(hidden, b);
+        kernels::hc_pre_norm(h, pre, d.final_norm, b, streams, hidden, eps,
+                             static_cast<__nv_bfloat16*>(x.data), nullptr, stream);
+        auto* plane = alloc<float>(std::size_t(b) * vocab);
+        project(x, head, plane, vocab);
+        auto* ids = static_cast<std::int32_t*>(d.ids.p);
+        CUDA_CHECK(cudaMemcpyAsync(ids, d_tokens.p, 4, cudaMemcpyDeviceToDevice, stream));
+        for (int i = 0; i < b; ++i) {
+            kernels::markov_step(plane + std::size_t(i) * vocab, d.markov_head, d.markov_embed, d.domain,
+                                 ids, i, d.scratch.p, stream);
+        }
+        kernels::dspark_confidence(h, pre, b, streams, hidden, d.confidence, d.markov_embed, ids,
+                                   static_cast<float*>(d.values.p), stream);
+        auto* host = static_cast<std::int32_t*>(d.host->data());
+        CUDA_CHECK(cudaMemcpyAsync(host, ids + 1, std::size_t(b) * 4, cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemcpyAsync(host + b, d.values.p, std::size_t(b) * 4, cudaMemcpyDeviceToHost,
+                                   stream));
+    }
+
+    void draft(std::uint32_t sequence, std::int32_t anchor, std::span<std::int32_t> drafts,
+               std::span<float> confidence) {
+        if (!drafter) { throw std::logic_error("deepseek_v41 draft: no DSpark drafter"); }
+        Drafter& d  = *drafter;
+        const int b = d.block;
+        if (sequence >= options.sequences || drafts.size() != std::size_t(b) ||
+            confidence.size() != std::size_t(b) || anchor < 0 || anchor >= vocab) {
+            throw std::invalid_argument("deepseek_v41 draft: invalid call");
+        }
+        const std::uint32_t first = positions[sequence];
+        if (first + std::uint32_t(b) > options.max_context) {
+            throw std::invalid_argument("deepseek_v41 draft: context capacity exceeded");
+        }
+        std::vector<std::int32_t> tokens(b, d.noise), pos(2 * b), seq(b, std::int32_t(sequence));
+        tokens[0] = anchor;
+        for (int i = 0; i < b; ++i) {
+            pos[std::size_t(i)]     = std::int32_t(first) + i;
+            pos[std::size_t(b + i)] = std::int32_t(first) + b - 1;
+        }
+        stage(tokens, pos, seq);
+        run_graph(32 + std::uint32_t(b), [&] { draft_pass(b); });
+        d.copied->record(stream);
+        d.copied->synchronize();
+        const auto* host = static_cast<const std::int32_t*>(d.host->data());
+        std::copy_n(host, b, drafts.begin());
+        std::memcpy(confidence.data(), host + b, std::size_t(b) * 4);
+    }
+
     // A pass over staged rows (tokens, positions and, for decode rows, sequences on the device; the
     // Engram rows copied).
     void run(const Pass& s) {
         const int t = s.t;
+        image_mask  = step_images.empty() ? nullptr : static_cast<const std::uint8_t*>(d_image.p) + s.row;
         workspace->reset();
         auto scope = workspace->scope();
         auto* h    = alloc<float>(std::size_t(t) * streams * hidden);
@@ -1278,13 +1807,22 @@ struct Executor::Impl {
         auto* candidates  = candidate_words > 0 ? alloc<std::uint32_t>(std::size_t(t) * candidate_words)
                                                 : nullptr;
         const float* pre = nullptr; // the first block reads stream 0
-        for (const LayerPlan& p : layers) {
-            if (p.engram >= 0) { engram_block(p, h, t); }
+        // With the drafter, the pass's last rows (a window at most) tap its target blocks.
+        const int tapped = drafter ? std::min(t, window) : 0;
+        for (std::size_t l = 0; l < layers.size(); ++l) {
+            const LayerPlan& p = layers[l];
+            if (tapped > 0) { tap(l, h + std::size_t(t - tapped) * streams * hidden, tapped, 0); }
+            if (p.engram >= 0) { engram_block(p, h, t, s); }
             mixes(p.hc_attention, h, t, mix_scratch, attention_site);
             attention(p, h, pre, t, s, topk, candidates, attention_site);
             mixes(p.hc_ffn, h, t, mix_scratch, ffn_site);
             ffn(p, h, attention_site.pre, t, ffn_site);
             pre = ffn_site.pre;
+        }
+        if (tapped > 0 && s.seed) {
+            const int from = s.row + t - tapped;
+            seed(tapped, 0, static_cast<const std::int32_t*>(d_positions.p) + from,
+                 s.chunk ? nullptr : static_cast<const std::int32_t*>(d_sequences.p) + from, s.sequence);
         }
         if (s.logit_rows == 0) { return; }
         const int first = t - s.logit_rows;
@@ -1297,9 +1835,68 @@ struct Executor::Impl {
 
     // ---- Calls -----------------------------------------------------------------------------------
 
+    [[nodiscard]] std::uint32_t prompt_step() const noexcept {
+        return span_tokens != 0 ? span_tokens : options.prefill_chunk;
+    }
+
+    // A step's images, kept while it runs.
+    struct StepImages {
+        Impl& impl;
+        ~StepImages() {
+            impl.step_images.clear();
+            impl.step_dead.clear();
+            impl.image_mask = nullptr;
+        }
+    };
+
+    // Checks a step's images against its t rows and stages their flags.
+    void stage_images(std::span<const ImageRows> images, int t) {
+        if (images.empty()) { return; }
+        if (!tower) { throw std::invalid_argument("deepseek_v41 forward: images need the vision tower"); }
+        step_dead.assign(std::size_t(t), 0);
+        std::size_t next = 0;
+        for (const ImageRows& piece : images) {
+            const std::size_t count = piece.embeddings.size() / std::size_t(hidden);
+            if (count == 0 || piece.embeddings.size() % std::size_t(hidden) != 0 || piece.row < next ||
+                piece.row + count > std::size_t(t) || count > tower->config().max_image_tokens) {
+                throw std::invalid_argument("deepseek_v41 forward: image rows outside the call or "
+                                            "out of order");
+            }
+            std::fill_n(step_dead.begin() + piece.row, count, std::uint8_t(1));
+            next = piece.row + count;
+        }
+        step_images.assign(images.begin(), images.end());
+        image_staged->synchronize();
+        std::memcpy(h_image->data(), step_dead.data(), step_dead.size());
+        CUDA_CHECK(cudaMemcpyAsync(d_image.p, h_image->data(), step_dead.size(),
+                                   cudaMemcpyHostToDevice, stream));
+        image_staged->record(stream);
+    }
+
+    // The pieces of `images` within rows [begin, end), rows counted from begin.
+    std::vector<ImageRows> slice_images(std::span<const ImageRows> images, std::size_t begin,
+                                        std::size_t end) const {
+        std::vector<ImageRows> out;
+        for (const ImageRows& piece : images) {
+            const std::size_t count = piece.embeddings.size() / std::size_t(hidden);
+            const std::size_t from = std::max<std::size_t>(piece.row, begin);
+            const std::size_t to   = std::min<std::size_t>(piece.row + count, end);
+            if (from >= to) { continue; }
+            out.push_back({std::uint32_t(from - begin),
+                           piece.embeddings.subspan((from - piece.row) * std::size_t(hidden),
+                                                    (to - from) * std::size_t(hidden))});
+        }
+        return out;
+    }
+
     void forward(std::uint32_t sequence, std::span<const std::int32_t> tokens,
-                 std::uint32_t logit_rows, std::uint32_t logit_column = 0) {
+                 std::uint32_t logit_rows, std::uint32_t logit_column = 0,
+                 std::span<const ImageRows> images = {}) {
         const int t = int(tokens.size());
+        if (std::uint32_t(t) > options.prefill_chunk && logit_column == 0) {
+            forward_span(sequence, tokens, logit_rows, images);
+            return;
+        }
         if (sequence >= options.sequences || t <= 0 || std::uint32_t(t) > options.prefill_chunk ||
             logit_rows > std::min<std::uint32_t>(t, kMaxLogitRows) ||
             logit_column + logit_rows > kMaxLogitRows) {
@@ -1312,8 +1909,10 @@ struct Executor::Impl {
         back(sequence, first + std::uint32_t(t));
         std::vector<std::int32_t> pos(t);
         for (int i = 0; i < t; ++i) { pos[i] = std::int32_t(first) + i; }
+        StepImages kept{*this};
         stage(tokens, pos, {});
-        read_engram_rows(tokens, std::vector<std::uint32_t>(std::size_t(t), sequence), true);
+        stage_images(images, t);
+        read_engram_rows(tokens, std::vector<std::uint32_t>(std::size_t(t), sequence), true, step_dead);
         Pass s;
         s.t            = t;
         s.chunk        = true;
@@ -1325,9 +1924,122 @@ struct Executor::Impl {
         positions[sequence] = first + std::uint32_t(t);
     }
 
+    // A prompt span of several chunks, layer by layer: every chunk passes a block before any
+    // passes the next, so the block's wide calls bring the experts the cache lacks into one layer
+    // bank for every chunk of the span while the delivery prefetches the next block's bank. The
+    // span's residual streams, its blocks' coefficients and its index selections stay between
+    // blocks in memory borrowed from an elastic expert cache (borrow_span), else in the workspace;
+    // each chunk's arithmetic is forward()'s, and the logits are the span's last rows.
+    void forward_span(std::uint32_t sequence, std::span<const std::int32_t> tokens,
+                      std::uint32_t logit_rows, std::span<const ImageRows> images = {}) {
+        const int n = int(tokens.size()), c = int(options.prefill_chunk);
+        if (sequence >= options.sequences || std::uint32_t(n) > span_tokens ||
+            logit_rows > std::min<std::uint32_t>(n, kMaxLogitRows)) {
+            throw std::invalid_argument("deepseek_v41 forward: invalid prompt span");
+        }
+        const std::uint32_t first = positions[sequence];
+        if (first + std::uint32_t(n) > options.max_context) {
+            throw std::invalid_argument("deepseek_v41 forward: context capacity exceeded");
+        }
+        back(sequence, first + std::uint32_t(n));
+        DeviceBuffer borrowed;
+        if (span_borrow_bytes != 0) {
+            borrowed = borrow_span(std::uint32_t(n));
+            if (!borrowed.p) {
+                // The cache cannot lend the span's buffers now: its halves (whole chunks) as spans
+                // whose buffers it may lend, down to chunk by chunk.
+                const int half = (n / 2 + c - 1) / c * c;
+                const auto first_images = slice_images(images, 0, std::size_t(half));
+                const auto last_images  = slice_images(images, std::size_t(half), std::size_t(n));
+                forward(sequence, tokens.first(std::size_t(half)), 0, 0, first_images);
+                forward(sequence, tokens.subspan(std::size_t(half)), logit_rows, 0, last_images);
+                return;
+            }
+        }
+        std::size_t taken = 0;
+        // The span's buffers: from the borrowed memory (in span_buffers' order), else the workspace.
+        const auto span_alloc = [&](std::size_t bytes) -> void* {
+            if (!borrowed.p) { return workspace->alloc_bytes(bytes).data; }
+            void* p = static_cast<std::byte*>(borrowed.p) + taken;
+            taken += round_up(bytes, kAlign);
+            return p;
+        };
+        std::vector<std::int32_t> pos(n);
+        for (int i = 0; i < n; ++i) { pos[i] = std::int32_t(first) + i; }
+        StepImages kept{*this};
+        stage(tokens, pos, {});
+        stage_images(images, n);
+        read_engram_rows(tokens, std::vector<std::uint32_t>(std::size_t(n), sequence), true, step_dead);
+        workspace->reset();
+        auto scope = workspace->scope();
+        auto* h    = static_cast<float*>(span_alloc(std::size_t(n) * streams * hidden * 4));
+        embed(n, h);
+        const int site = 2 * streams + streams * streams;
+        Coefficients attention_site, ffn_site;
+        for (Coefficients* co : {&attention_site, &ffn_site}) {
+            auto* base = static_cast<float*>(span_alloc(std::size_t(n) * site * 4));
+            co->pre    = base;
+            co->post   = base + std::size_t(n) * streams;
+            co->comb   = base + std::size_t(n) * 2 * streams;
+        }
+        auto* topk       = static_cast<std::int32_t*>(span_alloc(std::size_t(n) * index_topk * 4));
+        auto* candidates = candidate_words > 0
+                               ? static_cast<std::uint32_t*>(span_alloc(std::size_t(n) * candidate_words * 4))
+                               : nullptr;
+        auto* mix_scratch = alloc<float>(std::size_t(c) * config.hc_mixes());
+        const auto rows_of = [&](const Coefficients& co, int row) {
+            return Coefficients{co.pre + std::size_t(row) * streams, co.post + std::size_t(row) * streams,
+                                co.comb + std::size_t(row) * streams * streams};
+        };
+        const int tapped = drafter ? std::min(n, window) : 0; // the span's last rows the drafter taps
+        for (std::size_t l = 0; l < layers.size(); ++l) {
+            const LayerPlan& p = layers[l];
+            for (int row = 0; row < n; row += c) {
+                Pass s;
+                s.t        = std::min(c, n - row);
+                s.chunk    = true;
+                s.row      = row;
+                s.staged   = n;
+                s.sequence = sequence;
+                s.first    = first + std::uint32_t(row);
+                float* hc  = h + std::size_t(row) * streams * hidden;
+                if (const int lo = std::max(row, n - tapped); tapped > 0 && lo < row + s.t) {
+                    tap(l, h + std::size_t(lo) * streams * hidden, row + s.t - lo, lo - (n - tapped));
+                }
+                const Coefficients a = rows_of(attention_site, row), f = rows_of(ffn_site, row);
+                image_mask = step_images.empty()
+                                 ? nullptr
+                                 : static_cast<const std::uint8_t*>(d_image.p) + row;
+                if (p.engram >= 0) { engram_block(p, hc, s.t, s); }
+                mixes(p.hc_attention, hc, s.t, mix_scratch, a);
+                // The first block reads stream 0; a later one the previous block's ffn site.
+                attention(p, hc, l == 0 ? nullptr : f.pre, s.t, s,
+                          topk + std::size_t(row) * index_topk,
+                          candidates ? candidates + std::size_t(row) * candidate_words : nullptr, a);
+                mixes(p.hc_ffn, hc, s.t, mix_scratch, f);
+                ffn(p, hc, a.pre, s.t, f);
+            }
+        }
+        if (tapped > 0) {
+            seed(tapped, 0, static_cast<const std::int32_t*>(d_positions.p) + (n - tapped), nullptr,
+                 sequence);
+        }
+        if (logit_rows > 0) {
+            const int last = n - int(logit_rows);
+            Tensor x       = alloc_bf16(hidden, int(logit_rows));
+            kernels::hc_pre_norm(h + std::int64_t(last) * streams * hidden,
+                                 ffn_site.pre + std::int64_t(last) * streams, final_norm,
+                                 int(logit_rows), streams, hidden, eps,
+                                 static_cast<__nv_bfloat16*>(x.data), nullptr, stream);
+            head_logits(static_cast<const __nv_bfloat16*>(x.data), int(logit_rows), 0);
+        }
+        give_back(borrowed);
+        positions[sequence] = first + std::uint32_t(n);
+    }
+
     // The Engram rows of a pass whose row r belongs to owners[r], from that sequence's history.
     void read_engram_rows(std::span<const std::int32_t> tokens, std::span<const std::uint32_t> owners,
-                          bool advance) {
+                          bool advance, std::span<const std::uint8_t> dead = {}) {
         if (!engram) { return; }
         std::vector<EngramHasher::History> view(tokens.size());
         // Each run of rows of one sequence continues that sequence's history; a verification's
@@ -1339,9 +2051,12 @@ struct Executor::Impl {
             view[r] = histories[owners[r]];
             r       = end;
         }
-        read_engram(tokens, owners, view, false);
+        read_engram(tokens, owners, view, false, dead);
         if (advance) {
-            for (std::size_t i = 0; i < tokens.size(); ++i) { advance_history(owners[i], tokens.subspan(i, 1)); }
+            for (std::size_t i = 0; i < tokens.size(); ++i) {
+                advance_history(owners[i], tokens.subspan(i, 1),
+                                dead.empty() ? dead : dead.subspan(i, 1));
+            }
         }
     }
 
@@ -1424,6 +2139,7 @@ struct Executor::Impl {
         Pass s;
         s.t          = rows;
         s.logit_rows = rows;
+        s.seed       = false; // commit() seeds the rows it keeps
         run_graph(16 + std::uint32_t(rows), [&] { run(s); });
         verify_width = std::uint32_t(w);
     }
@@ -1441,6 +2157,16 @@ struct Executor::Impl {
             advance_history(s, std::span<const std::int32_t>(verified[s]).first(kept[j]));
             verified[s].clear();
             positions[s] += kept[j];
+        }
+        if (drafter) {
+            // The kept rows' taps into the drafter's rings, at the positions and sequences the
+            // verification staged.
+            workspace->reset();
+            const auto row = [&](std::size_t j) { return std::int32_t(j * verify_width); };
+            for (std::size_t j = 0; j < sequences.size(); ++j) {
+                seed(int(kept[j]), row(j), static_cast<const std::int32_t*>(d_positions.p) + row(j),
+                     static_cast<const std::int32_t*>(d_sequences.p) + row(j), sequences[j]);
+            }
         }
         verify_width = 0;
     }
@@ -1460,6 +2186,12 @@ struct Executor::Impl {
                 const auto& score = checkpoint ? p.checkpoint_score : p.tail_score;
                 out.emplace_back(static_cast<std::uint8_t*>(kv.p) + sequence * tail_bytes, tail_bytes);
                 out.emplace_back(static_cast<std::uint8_t*>(score.p) + sequence * tail_bytes, tail_bytes);
+            }
+        }
+        if (drafter) {
+            for (const LayerPlan& p : drafter->layers) {
+                const auto& ring = checkpoint ? p.checkpoint_ring : p.ring;
+                out.emplace_back(static_cast<std::uint8_t*>(ring.p) + sequence * ring_bytes, ring_bytes);
             }
         }
         return out;
@@ -1544,6 +2276,12 @@ struct Executor::Impl {
                 commit(owners, std::vector<std::uint32_t>(n, 1));
                 CUDA_CHECK(cudaStreamSynchronize(stream));
                 for (const std::uint32_t s : owners) { reset_state(s); }
+            }
+            if (drafter) {
+                std::vector<std::int32_t> drafts(std::size_t(drafter->block));
+                std::vector<float> confidence(drafts.size());
+                draft(0, 2, drafts, confidence);
+                reset_state(0);
             }
         }
         if (delivery) {
@@ -1652,7 +2390,10 @@ ExecutorMemory Executor::memory() const noexcept {
                           .kv_backed_bytes = impl_->kv_backed.load(std::memory_order_relaxed),
                           .kv_grows        = impl_->growing,
                           .workspace_bytes = impl_->workspace_bytes,
+                          .span_borrow_bytes = impl_->span_borrow_bytes,
                           .engram_resident_bytes = impl_->engram ? impl_->engram->resident_bytes() : 0,
+                          .vision_encode_bytes = impl_->tower ? impl_->tower->workspace_bytes() : 0,
+                          .vision_owned_bytes  = impl_->vision_owned_bytes(),
                           .experts = impl_->delivery ? impl_->delivery->memory() : ExpertDeliveryMemory{}};
 }
 
@@ -1702,10 +2443,23 @@ std::string Executor::engram_description() const {
     return impl_->engram->io_backend();
 }
 
+std::string Executor::expert_cpu_description() const {
+    return impl_->delivery ? impl_->delivery->cpu_description() : std::string();
+}
+
+std::uint32_t Executor::prompt_step() const noexcept { return impl_->prompt_step(); }
+
 void Executor::forward(std::uint32_t sequence, std::span<const std::int32_t> tokens,
-                       std::uint32_t logit_rows) {
+                       std::uint32_t logit_rows, std::span<const ImageRows> images) {
     if (logit_rows == 0) { throw std::invalid_argument("deepseek_v41 forward: no logit rows"); }
-    impl_->forward(sequence, tokens, logit_rows);
+    impl_->forward(sequence, tokens, logit_rows, 0, images);
+}
+
+bool Executor::vision() const noexcept { return impl_->tower != nullptr; }
+
+void Executor::encode_image(std::span<const std::uint16_t> patches, int grid_w, int grid_h,
+                            std::span<std::uint16_t> rows) {
+    impl_->encode_image(patches, grid_w, grid_h, rows);
 }
 
 void Executor::forward_branches(std::uint32_t sequence, std::span<const std::int32_t> tokens,
@@ -1734,6 +2488,15 @@ Tensor Executor::logits(std::uint32_t rows) const {
 cudaStream_t Executor::head_stream() const noexcept { return impl_->stream; }
 
 std::uint32_t Executor::draft_tokens() const noexcept { return impl_->options.draft_tokens; }
+
+std::uint32_t Executor::dspark_block() const noexcept {
+    return impl_->drafter ? std::uint32_t(impl_->drafter->block) : 0;
+}
+
+void Executor::draft(std::uint32_t sequence, std::int32_t anchor, std::span<std::int32_t> drafts,
+                     std::span<float> confidence) {
+    impl_->draft(sequence, anchor, drafts, confidence);
+}
 
 void Executor::verify(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> tokens) {
     impl_->verify(sequences, tokens);

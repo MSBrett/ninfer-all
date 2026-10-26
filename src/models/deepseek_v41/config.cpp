@@ -178,4 +178,72 @@ TextConfig parse_text_config(const Json& value) {
     return out;
 }
 
+DSparkConfig parse_dspark_config(const Json& value, const TextConfig& text) {
+    const auto& architectures = value.at("architectures");
+    if (!architectures.is_array() || architectures.size() != 1 ||
+        architectures[0] != "DeepseekV41DSpark" ||
+        value.value("model_type", "") != "deepseek_v41_dspark") {
+        throw ArtifactError("DeepSeek-V4.1 DSpark config: architecture/model_type mismatch");
+    }
+    DSparkConfig out;
+    out.layers      = integer(value, "num_hidden_layers");
+    out.block_size  = integer(value, "block_size");
+    out.markov_rank = integer(value, "markov_rank");
+    out.experts     = integer(value, "n_routed_experts");
+    out.top_k       = integer(value, "num_experts_per_tok");
+    out.noise_token = static_cast<std::int32_t>(integer(value, "noise_token_id", false));
+    for (const auto id : u64_list(member(value, "target_layer_ids"), "target_layer_ids")) {
+        if (id >= text.num_hidden_layers ||
+            (!out.target_layers.empty() && id <= out.target_layers.back())) {
+            throw ArtifactError("DeepSeek-V4.1 DSpark config: target_layer_ids must name backbone "
+                                "blocks in order");
+        }
+        out.target_layers.push_back(static_cast<std::uint32_t>(id));
+    }
+    // A draft's rows are one decode pass of the vector kernels (at most eight), its Markov rank
+    // a warp's eight values per lane.
+    const bool ok = out.block_size >= 1 && out.block_size <= 8 && out.markov_rank == 256 &&
+                    out.experts <= 512 && out.top_k >= 1 && out.top_k <= 8 &&
+                    out.top_k <= out.experts && !out.target_layers.empty() &&
+                    std::uint32_t(out.noise_token) < text.vocab_size;
+    if (!ok) {
+        throw ArtifactError("DeepSeek-V4.1 DSpark config: geometry outside the implemented kernels");
+    }
+    return out;
+}
+
+VisionConfig parse_vision_config(const Json& value, const TextConfig& text) {
+    const auto& architectures = member(value, "architectures");
+    if (!architectures.is_array() || architectures.size() != 1 ||
+        architectures[0] != "DeepseekV41VisionModel" ||
+        value.value("model_type", "") != "deepseek_v41_vision") {
+        throw ArtifactError("DeepSeek-V4.1 vision config: architecture/model_type mismatch");
+    }
+    VisionConfig out;
+    out.num_hidden_layers   = integer(value, "num_hidden_layers");
+    out.hidden_size         = integer(value, "hidden_size");
+    out.num_attention_heads = integer(value, "num_attention_heads");
+    out.intermediate_size   = integer(value, "intermediate_size");
+    out.patch_size          = integer(value, "patch_size");
+    out.downsample_ratio    = integer(value, "downsample_ratio");
+    out.max_image_tokens    = integer(value, "max_image_tokens");
+    out.min_pixels          = integer(value, "min_pixels");
+    out.projection_dim      = integer(value, "projection_dim");
+    out.rope_theta          = real(value, "rope_theta");
+    out.rms_norm_eps        = real(value, "rms_norm_eps");
+    out.image_token_id      = static_cast<std::int32_t>(integer(value, "image_token_id", false));
+    // The tower's kernels: heads of 64 values (16 per rotation axis), rows of whole 8-value
+    // vectors; a span of at least one aligner row.
+    const bool ok = out.hidden_size % out.num_attention_heads == 0 && out.head_dim() == 64 &&
+                    out.hidden_size % 8 == 0 && out.intermediate_size % 8 == 0 &&
+                    out.projection_dim == text.hidden_size &&
+                    std::uint32_t(out.image_token_id) < text.vocab_size &&
+                    out.max_image_tokens >= VisionConfig::span_tokens(1, 1) &&
+                    value.contains("max_wh_ratio") && value.at("max_wh_ratio").is_null();
+    if (!ok) {
+        throw ArtifactError("DeepSeek-V4.1 vision config: geometry outside the implemented kernels");
+    }
+    return out;
+}
+
 } // namespace ninfer::models::deepseek_v41

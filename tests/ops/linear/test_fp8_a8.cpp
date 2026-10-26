@@ -64,10 +64,10 @@ int check_ada_crossover() {
         }
         failures += run_shape("FP8 Ada production A16", ActivationCompute::A16, make_fp8_weight,
                               {5120, 6144, 2077U, Comparison::SampledRows, true, a16_points,
-                               ActivationSigns::Centered, true});
+                               ActivationSigns::Centered, DType::BF16, true});
         failures += run_shape("FP8 Ada production A8", ActivationCompute::A8, make_fp8_weight,
                               {5120, 6144, 2077U, Comparison::SampledRows, true, production_a8,
-                               ActivationSigns::Centered, true});
+                               ActivationSigns::Centered, DType::BF16, true});
         {
             ops::DeviceRouteForce candidate("fp8_linear/5120x6144", "a8");
             if (capacity(17, 17) == 0 || capacity(16, 33) != capacity(33, 33)) {
@@ -77,7 +77,7 @@ int check_ada_crossover() {
             for (const auto signs : {ActivationSigns::Centered, ActivationSigns::Biased})
                 failures += run_shape("FP8 Ada direct A8", ActivationCompute::A8, make_fp8_weight,
                                       {5120, 6144, 2077U, Comparison::SampledRows, true, a8_points,
-                                       signs, true});
+                                   signs, DType::BF16, true});
             if (ops::linear_workspace_capacity_bytes(
                     QType::FP8_E4M3FN_ROW_BF16, 5120, 6144,
                     ops::LinearPolicy::A16Only, 17, 33) != 0) {
@@ -87,7 +87,7 @@ int check_ada_crossover() {
             failures += run_shape("FP8 Ada forced A8 respects A16Only", ActivationCompute::A16,
                                   make_fp8_weight,
                                   {5120, 6144, 2077U, Comparison::SampledRows, true, a16_permission,
-                                   ActivationSigns::Centered, true});
+                                   ActivationSigns::Centered, DType::BF16, true});
         }
         {
             ops::DeviceRouteForce candidate("fp8_linear/5120x6144", "a16");

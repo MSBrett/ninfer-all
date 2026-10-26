@@ -21,6 +21,12 @@ const Nvfp4LinearShape& resolve_shape(std::int32_t n, std::int32_t k, LinearPoli
 }
 } // namespace
 
+bool nvfp4_registered(std::int32_t n, std::int32_t k) {
+    for (const auto* shape : kShapes)
+        if (shape->n == n && shape->k == k) return true;
+    return false;
+}
+
 static std::size_t nvfp4_linear_workspace_capacity_bytes_own(std::int32_t n, std::int32_t k,
                                                              LinearPolicy policy,
                                                              std::int32_t min_tokens,
@@ -36,11 +42,18 @@ static std::size_t nvfp4_linear_workspace_capacity_bytes_own(std::int32_t n, std
 std::size_t nvfp4_linear_workspace_capacity_bytes(std::int32_t n, std::int32_t k,
                                                   LinearPolicy policy, std::int32_t min_tokens,
                                                   std::int32_t max_tokens) {
+    if (!nvfp4_registered(n, k)) {
+        if (min_tokens <= 0 || max_tokens < min_tokens)
+            throw std::invalid_argument("nvfp4 linear workspace: invalid token interval");
+        if (!valid_linear_policy(policy))
+            throw std::invalid_argument("nvfp4 linear: unsupported policy");
+        return 0;
+    }
     if (allows_a8(policy) && current_device_ada_fp8()) {
         if (min_tokens <= 0 || max_tokens < min_tokens)
             throw std::invalid_argument("nvfp4 linear workspace: invalid token interval");
-        (void)resolve_shape(n,k,policy);
-        return nvfp4_ada_a8_capacity(policy,Nvfp4AdaOp::Linear,n,k,min_tokens,max_tokens);
+        (void)resolve_shape(n, k, policy);
+        return nvfp4_ada_a8_capacity(policy, Nvfp4AdaOp::Linear, n, k, min_tokens, max_tokens);
     }
     return capacity_by_table(
         min_tokens, max_tokens,
@@ -57,12 +70,19 @@ std::size_t nvfp4_linear_workspace_capacity_bytes(std::int32_t n, std::int32_t k
 
 void nvfp4_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPolicy policy,
                     WorkspaceArena* workspace, cudaStream_t stream) {
-    if (nvfp4_uses_ada_a8(policy,Nvfp4AdaOp::Linear,weight.n,weight.k,x.ne[1])) {
-        validate_nvfp4_weight(weight,"nvfp4 linear");
-        (void)resolve_shape(weight.n,weight.k,policy);
+    if (out.dtype == DType::FP32 || !nvfp4_registered(weight.n, weight.k)) {
+        validate_nvfp4_weight(weight, "nvfp4 linear");
+        if (x.ne[1] <= 0) throw std::invalid_argument("nvfp4 linear: T must be positive");
+        if (!valid_linear_policy(policy))
+            throw std::invalid_argument("nvfp4 linear: unsupported policy");
+        return nvfp4_general_a16(x, weight, out, stream);
+    }
+    if (nvfp4_uses_ada_a8(policy, Nvfp4AdaOp::Linear, weight.n, weight.k, x.ne[1])) {
+        validate_nvfp4_weight(weight, "nvfp4 linear");
+        (void)resolve_shape(weight.n, weight.k, policy);
         if (x.ne[1] <= 0) throw std::invalid_argument("nvfp4 linear: T must be positive");
         if (!workspace) throw std::invalid_argument("nvfp4 A8 linear requires caller workspace");
-        nvfp4_a8_linear_launch(x,weight,out,*workspace,stream);
+        nvfp4_a8_linear_launch(x, weight, out, *workspace, stream);
         return;
     }
     policy = nvfp4_ada_fallback_policy(policy);

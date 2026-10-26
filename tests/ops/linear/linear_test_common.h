@@ -71,6 +71,8 @@ struct ShapeCase {
     bool verify_input_preservation;
     std::span<const Invocation> invocations;
     ActivationSigns activation_signs = ActivationSigns::Centered;
+    // BF16, or FP32: a tensor-parallel rank's partial sum, which the ranks add before rounding.
+    DType out = DType::BF16;
     bool require_supported = false;
 };
 

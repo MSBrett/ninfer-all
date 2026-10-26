@@ -6,7 +6,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
-#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -60,20 +59,17 @@ public:
         const std::byte* inputs = nullptr; // the device inputs begin() copied, in order
         std::byte* products     = nullptr; // ExpertCpuOptions::product_bytes
         CpuSpinPool* pool       = nullptr; // the service thread and its pinned workers
-        // Runs once on the calling thread while the pool starts the first rows: the call's
-        // copies, which so overlap the products.
-        std::function<void()> side;
     };
 
     struct Done {
         // The bytes of the product buffer the pairs used, from its start (at most
         // ExpertCpuOptions::product_bytes): only those reach the device.
         std::size_t bytes   = 0;
-        double microseconds = 0; // the products' time, side() left out
+        double microseconds = 0; // the products' time
     };
 
-    // Writes the products of the pairs routed to work.experts and runs work.side once. Runs on the
-    // delivery's service thread.
+    // Writes the products of the pairs routed to work.experts. Runs on the delivery's service
+    // thread, after the call's copies are issued.
     virtual Done compute(const Work& work) = 0;
 };
 
@@ -192,13 +188,17 @@ struct ExpertDeliveryMemory {
 // at a time after the calls' own work, each candidate's entries moved once its copy has landed.
 // A wide call (half the layer's experts or more: a prompt chunk) brings its misses into a layer
 // bank, laid out like a resident bank (expert e of blob b at a fixed stride) with one copy per run
-// of consecutive experts, starts the bank of the layer that followed it last time, and promotes its
+// of consecutive experts (repeated wide calls to one layer, a prompt span's chunks, fill only what
+// its bank lacks), starts the bank of the other layer whose wide call followed its last wide call
+// (narrow calls between prompts do not change that order), and promotes its
 // most routed experts from the bank into free cache slots by device copies, up to the layer's
 // share; it evicts nothing and counts nothing, so a prompt does not push out the decode working set.
 // While only narrow calls run, the banks are lent to the cache (ExpertDeliveryOptions::lend_banks):
 // a narrow call's miss that no cache slot takes enters a free slot of a lent bank, else the slot of
-// its least routed expert the call does not route, and stays there for later calls. A wide call
-// treats the lent slots as misses and takes back the bank it fills.
+// its least routed expert the call does not route, and stays there for later calls. A round
+// candidate that a narrow call routes from a lent slot moves to its cache slot only at a later call,
+// so no miss of the call takes the slot its cached pairs read. A wide call treats the lent slots as
+// misses and takes back the bank it fills.
 class ExpertDelivery {
 public:
     ExpertDelivery(const RankContext& rank, std::vector<std::filesystem::path> files,

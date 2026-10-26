@@ -5,6 +5,7 @@
 #include "product/post_thinking_options.h"
 #include "product/reasoning_loop_options.h"
 #include "product/rope_yarn_options.h"
+#include "product/tensor_split_options.h"
 #include "product/speculative_options.h"
 
 #include <cerrno>
@@ -180,6 +181,8 @@ std::string usage_text(const char* argv0) {
            "  --tensor-parallel             the --devices share every layer: GDN heads and\n"
            "                                dense FFN rows; attention, KV, head and MTP on\n"
            "                                the first (dense Qwen3.5-core GGUF models)\n"
+           "  --tensor-split A,B,...        relative share of each --devices entry (default:\n"
+           "                                by each card's measured bandwidth and free memory)\n"
            "  --expert-residency device|host|disk  MoE experts on GPU (default), in pinned\n"
            "                                host memory, or in artifact files\n"
            "  --expert-cache-mib N|auto     persistent GPU cache (default auto); native Qwen,\n"
@@ -204,11 +207,13 @@ std::string usage_text(const char* argv0) {
            std::string(product::kKvResidentHelp) +
            "\n"
            "SPECULATIVE DECODING\n"
-           "  --spec none|mtp|dflash|dflash2\n"
+           "  --spec none|mtp|dflash|dflash2|dspark\n"
            "                                speculative decoding backend (default: mtp with 3\n"
            "                                drafts for Flash-Next and Gemma 4 host or disk\n"
-           "                                experts whose artifact has the drafter, else none)\n"
-           "  --draft-tokens N              drafts per round, 1..15\n"
+           "                                experts whose artifact has the drafter, else none;\n"
+           "                                dspark: DeepSeek-V4.1's DSpark drafter)\n"
+           "  --draft-tokens N              drafts per round, 1..15 (dspark: up to its block\n"
+           "                                of 5, the default)\n"
            "  --draft-min-p P              Flash-Next MTP confidence floor, 0..1 (default 0;\n"
            "                                0.5 when the engine chooses MTP)\n"
            "  --lm-head-draft               draft with the optimized proposal head, which\n"
@@ -226,8 +231,8 @@ std::string usage_text(const char* argv0) {
            "                                --spec is set, 0 disables it\n"
            "  --ngram-min-match N           shortest match a copy is drawn from, 4..64\n"
            "                                (default 12)\n"
-           "  --lookup-ngram N              context-lookup drafting alongside --spec (Flint\n"
-           "                                and DeepSeek-V4.1, which have no drafter, without\n"
+           "  --lookup-ngram N              context-lookup drafting alongside --spec (Flint,\n"
+           "                                which has no drafter, and DeepSeek-V4.1 without\n"
            "                                it): the last N tokens are matched against the\n"
            "                                sequence so far and what followed is proposed\n"
            "                                (default 0: off)\n"
@@ -388,6 +393,8 @@ Options parse_options(int argc, char** argv) {
             options.stage_layers = parse_stage_layers(value(arg));
         } else if (arg == "--tensor-parallel") {
             options.tensor_parallel = true;
+        } else if (arg == "--tensor-split") {
+            options.tensor_split = ninfer::product::parse_tensor_split(value(arg));
         } else if (arg == "--expert-residency") {
             const std::string residency = value(arg);
             if (residency == "device") {
@@ -608,6 +615,8 @@ Options parse_options(int argc, char** argv) {
     if (options.tensor_parallel && options.devices.size() < 2) {
         throw std::invalid_argument("--tensor-parallel needs --devices naming more than one device");
     }
+    ninfer::product::check_tensor_split(options.tensor_split, options.devices.size(),
+                                        options.tensor_parallel);
     if (kv_headroom_mib.has_value()) {
         if (options.kv_capacity.mode != KvCapacityMode::Automatic) {
             throw std::invalid_argument("--kv-headroom-mib requires --kv-capacity auto");

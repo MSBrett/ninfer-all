@@ -55,6 +55,9 @@ struct LoadOptions {
     // The `ranks` devices share every layer instead (`--tensor-parallel`): each holds a share of
     // the GDN heads and dense FFN rows, and the first one the rest.
     bool tensor_parallel = false;
+    // The relative size of each rank's share (`--tensor-split`), one positive weight per device.
+    // Empty divides evenly; the engine fills it from each card's speed and free memory.
+    std::vector<double> tensor_split;
 
     bool operator==(const LoadOptions&) const = default;
 
@@ -103,6 +106,8 @@ struct LoadOptions {
             return "dflash";
         case SpeculativeBackend::DFlash2:
             return "dflash2";
+        case SpeculativeBackend::DSpark:
+            return "dspark";
         }
         return {};
     }
@@ -140,7 +145,8 @@ struct LoadOptions {
                                                               : VisionResidency::Resident,
             .ranks = std::max<std::size_t>(options.devices.size(), 1),
             .stage_layers = options.stage_layers,
-            .tensor_parallel = options.tensor_parallel};
+            .tensor_parallel = options.tensor_parallel,
+            .tensor_split    = options.tensor_split};
 }
 
 } // namespace ninfer::models
