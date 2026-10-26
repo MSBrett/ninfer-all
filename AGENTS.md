@@ -256,6 +256,17 @@ Read the authority relevant to the current decision; this is not a mandatory rea
 Use `cmake --build <build-dir> -j` by default. Adjust parallelism when actual resource pressure
 causes failures or interferes with the task, and briefly explain why.
 
+For an authorized local NInfer server rebuild or update, replacing the running server is part of
+the task. If its executable is locked, identify and stop that specific server, rebuild and replace
+the normal executable, then restart it with the same launch configuration. Do not leave the update
+in an alternate verification path or wait for another approval solely because the server is running.
+Leave unrelated processes alone. The desktop launcher runs the server directly, without RTK.
+
+Keep verification bounded to the requested change and supported host. Do not turn a build or
+upstream merge into a broad, platform-inapplicable test campaign or delay the usable server update
+with optional checks. When the user stops testing or an agent, stop that work and its owned child
+processes immediately; continue only the remaining authorized build, replacement and publication.
+
 Use a Python 3.11 interpreter explicitly; the default shell's `python3` may be a different
 version, so check it before relying on it. Build trees, artifacts and profiles live where the host
 keeps them (by convention `build/`, `models/`, `profiles/ncu/`, `profiles/nsys/`,
