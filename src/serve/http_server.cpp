@@ -304,8 +304,8 @@ HttpServer::HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> log
       request_jsonl_(options_.request_log_jsonl, options_.artifact_path, std::move(logger),
                      static_cast<std::uint64_t>(options_.request_log_max_mib) << 20U,
                      options_.request_log_keep) {
-    if (options_.log_stats_panel && panel != nullptr && panel->enabled()) {
-        console_stats_ = std::make_unique<ConsoleStatsPanel>(std::move(panel));
+    if ((options_.log_stats_panel || options_.tui_stats_panel) && panel != nullptr && panel->enabled()) {
+        console_stats_ = std::make_unique<ConsoleStatsPanel>(std::move(panel), options_.tui_stats_panel);
     }
     // cpp-httplib is thread-per-connection: a worker is held for a connection's whole
     // life, including the idle keep-alive window between requests. Sizing the pool to the
@@ -373,7 +373,7 @@ void HttpServer::record_request_done(const RequestLogContext& context,
     request_jsonl_.write_request_done(context, outcome);
     metrics_.record_done(outcome);
     operational_log_.request_done(context, outcome);
-    if (console_stats_) { console_stats_->request_done(outcome); }
+    if (console_stats_) { console_stats_->request_done(outcome, context.id); }
 }
 
 void HttpServer::record_request_failure(const RequestLogContext& context,
@@ -405,15 +405,40 @@ void HttpServer::run_stats_reporter() {
     };
 
     std::map<std::string, Previous> previous;
-    const auto sample = [&](bool tail) {
+    const bool tui = options_.tui_stats_panel && console_stats_ != nullptr;
+    const bool logs = options_.log_stats_interval_ms != 0;
+    const auto sample = [&](bool report_due, bool render_tui, bool tail) {
+        std::vector<ConsoleStatsSnapshot::Model> models;
         registry_->for_each_service([&](const std::string& id, GenerationService& service) {
             const ninfer::RuntimeStats current = service.runtime_stats();
             const Clock::time_point now        = Clock::now();
+            if (render_tui) {
+                ConsoleStatsSnapshot::Model model;
+                model.capacity.model_id = id;
+                model.capacity.max_concurrency = service.engine_options().max_concurrency;
+                // Capacity was captured at load/attach time. Never acquire the Engine execution
+                // lock (memory_summary) from this read-only dashboard's refresh thread.
+                {
+                    std::lock_guard lock(facts_mutex_);
+                    const auto facts = facts_.find(id);
+                    if (facts != facts_.end() && facts->second.service == &service) {
+                        model.capacity = facts->second.capacity;
+                    }
+                }
+                model.stats = current;
+                model.admitted = service.admitted_requests();
+                model.peak_admitted = service.peak_admitted_requests();
+                models.push_back(std::move(model));
+            }
+            if (!tui && !tail && console_stats_ && (public_model_id_.empty() || id == public_model_id_)) {
+                console_stats_->runtime(current);
+            }
             auto found                         = previous.find(id);
             if (found == previous.end() || found->second.service != &service) {
                 previous[id] = Previous{&service, current, now};
                 return;
             }
+            if (!report_due) { return; }
             const ThroughputReport report = make_throughput_report(
                 found->second.stats, current,
                 std::chrono::duration<double>(now - found->second.time).count());
@@ -426,28 +451,38 @@ void HttpServer::run_stats_reporter() {
                     record_throughput(report);
                 }
             }
-            if (!tail && console_stats_ && (public_model_id_.empty() || id == public_model_id_)) {
-                console_stats_->runtime(current);
-            }
             found->second = Previous{&service, current, now};
         });
+        if (render_tui) { console_stats_->runtime(std::move(models)); }
     };
-    sample(false);
+    sample(false, tui, false);
     const auto interval             = std::chrono::milliseconds(options_.log_stats_interval_ms);
-    Clock::time_point next_deadline = Clock::now() + interval;
+    const auto refresh = std::chrono::seconds(1);
+    const auto started = Clock::now();
+    Clock::time_point next_log = logs ? started + interval : Clock::time_point::max();
+    Clock::time_point next_tui = tui ? started + refresh : Clock::time_point::max();
     for (;;) {
         {
             std::unique_lock lock(stats_mutex_);
-            if (stats_cv_.wait_until(lock, next_deadline, [this] { return stats_stopping_; })) {
+            if (stats_cv_.wait_until(lock, std::min(next_log, next_tui), [this] { return stats_stopping_; })) {
                 break;
             }
         }
-        sample(false);
-        next_deadline += interval;
+        const auto now = Clock::now();
+        const bool log_due = now >= next_log;
+        const bool tui_due = now >= next_tui;
+        sample(log_due, tui_due, false);
         const Clock::time_point after_write = Clock::now();
-        if (next_deadline <= after_write) { next_deadline = after_write + interval; }
+        if (log_due) {
+            next_log += interval;
+            if (next_log <= after_write) { next_log = after_write + interval; }
+        }
+        if (tui_due) {
+            next_tui += refresh;
+            if (next_tui <= after_write) { next_tui = after_write + refresh; }
+        }
     }
-    sample(true);
+    if (logs) { sample(true, false, true); }
 }
 
 void HttpServer::stop_stats_reporter() {
@@ -1556,7 +1591,7 @@ bool HttpServer::listen() {
     if (console_stats_) { console_stats_->show(); }
     try {
         start_stats_listener();
-        if (options_.log_stats_interval_ms != 0) {
+        if (options_.log_stats_interval_ms != 0 || (options_.tui_stats_panel && console_stats_)) {
             stats_stopping_ = false;
             stats_thread_   = std::thread([this] { run_stats_reporter(); });
         }

@@ -28,6 +28,7 @@ add_library(ninfer_serve STATIC
   branch_memo.cpp
   request_events.cpp
   console_stats.cpp
+  tui_stats.cpp
   operational_log.cpp
   request_log.cpp
   http_server.cpp

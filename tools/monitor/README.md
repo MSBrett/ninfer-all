@@ -5,6 +5,11 @@ Two stdlib-only Python sidecars for a resident `ninfer-serve`. Both read the ser
 listener of their own. When the server has an `--api-key`, export it in the environment variable
 named by `--api-key-env` (default `NINFER_API_KEY`).
 
+For a compact read-only view directly in the server console, use
+[`--tui-stats-panel on`](../../docs/serving.md#server-options). It needs no WebUI build, sidecar or request-log
+file. The terminal view shows recent request metrics and live Engine/cache statistics; this monitor
+adds hardware telemetry and long chart history.
+
 ## Dashboard: `monitor.py`
 
 Samples `/stats`, `nvidia-smi` and host CPU/RAM every `--interval` seconds (default 5), tails the

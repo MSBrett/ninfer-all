@@ -2,6 +2,7 @@
 #include "serve/console_stats.h"
 
 #include <cmath>
+#include <algorithm>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -145,6 +146,81 @@ int main() {
     const std::vector<std::string> rolled_lines = render_console_stats_panel(rolled);
     failures += check(rolled_lines.size() == 4 && contains(rolled_lines[3], "last 10"),
                       "a session beyond the window shows the recent row");
+
+    // The read-only dashboard presents recent-request percentiles, not the log table's ratio of
+    // sums. One-token/fully-cached requests have no executed decode/prefill phase to include.
+    ConsoleStatsPanel tui(logging->terminal_panel(), true);
+    tui.request_done(outcome(1000, 600, 101, 0.1, 0.2, 1.0), 42);
+    tui.request_done(outcome(100, 100, 1, 0.9, 0.0, 0.0), 43);
+    tui.request_done(outcome(1000, 0, 301, 0.2, 0.5, 1.0), 44);
+    tui.request_failure(RequestFailure{.classification = RequestFailureClass::Internal});
+    ConsoleStatsSnapshot::Model model;
+    model.capacity.model_id = "qwen-test";
+    model.capacity.max_concurrency = 8;
+    model.capacity.kv_capacity_pages = 100;
+    model.stats.device_main_kv_occupied_pages = 40;
+    model.stats.hybrid_host_capacity_bytes = 8ULL << 30;
+    model.stats.hybrid_host_used_bytes = 2ULL << 30;
+    model.stats.host_kv_occupied_bytes = 7ULL << 30; // hybrid gauge must take precedence
+    model.stats.running_requests = 1;
+    model.stats.prefilling_requests = 1;
+    model.stats.pressure_private_owners_evicted = 2;
+    model.admitted = 2;
+    tui.runtime(std::vector<ConsoleStatsSnapshot::Model>{model});
+    const auto dashboard = tui.snapshot();
+    const auto join = [](const std::vector<std::string>& rows) {
+        std::string result;
+        for (const auto& row : rows) { result += row + '\n'; }
+        return result;
+    };
+    const std::string rendered = join(render_tui_stats_panel(dashboard, 80, 24, false));
+    failures += check(contains(rendered, "100.0 tok/s") && contains(rendered, "300.0 tok/s"),
+                      "dashboard must use nearest-rank p50/p95 of executed decode phases");
+    failures += check(contains(rendered, "200 ms") && contains(rendered, "900 ms"),
+                      "dashboard must show actual recent TTFT percentiles");
+    failures += check(contains(rendered, "40.0%") && contains(rendered, "25.0%") &&
+                          contains(rendered, "2.00/8.00 GiB"),
+                      "dashboard must use Main KV pages and total hybrid host usage");
+    failures += check(contains(rendered, "evict 2") && contains(rendered, "1 failed") &&
+                          contains(rendered, "#44") && contains(rendered, "ACTIVE"),
+                      "dashboard must retain failures, pressure, latest requests and activity");
+    failures += check(!contains(rendered, "\x1b"), "colour-off dashboard must contain no SGR codes");
+    failures += check(contains(join(render_tui_stats_panel(dashboard, 80, 24, true)), "\x1b[96m"),
+                      "colour dashboard must use the terminal palette");
+    for (const std::size_t columns : {8U, 20U, 40U, 60U, 79U, 80U, 120U, 240U}) {
+        for (const std::size_t rows : {1U, 4U, 12U, 20U, 24U, 40U}) {
+            const auto output = render_tui_stats_panel(dashboard, columns, rows, true);
+            failures += check(output.size() < rows,
+                              "dashboard must leave log space and never need vertical scrolling");
+            for (const auto& line : output) {
+                failures += check(ninfer::product::terminal_display_width(line) < columns,
+                                  "dashboard must leave the autowrap column free");
+                failures += check(!contains(line, "\n") && !contains(line, "\r"),
+                                  "dashboard rows must not contain embedded cursor movement");
+            }
+        }
+    }
+    // An unloaded router clears old gauges; totals over completed requests remain visible.
+    tui.runtime(std::vector<ConsoleStatsSnapshot::Model>{});
+    const auto unloaded = join(render_tui_stats_panel(tui.snapshot(), 80, 24, false));
+    failures += check(contains(unloaded, "WAITING FOR MODEL") && !contains(unloaded, "40.0%") &&
+                          contains(unloaded, "3 done"),
+                      "unloading models must clear live gauges without losing session totals");
+    ConsoleStatsSnapshot empty;
+    const auto empty_text = join(render_tui_stats_panel(empty, 80, 24, false));
+    failures += check(contains(empty_text, "No completed requests yet") &&
+                          contains(empty_text, "--") && !contains(empty_text, "nan") &&
+                          !contains(empty_text, "inf"),
+                      "empty dashboard must show unavailable measurements rather than invented zeroes");
+    model.capacity.model_id = "hostile\nname\x1b[2J";
+    model.stats.running_requests = 0;
+    model.stats.prefilling_requests = 0;
+    model.admitted = 0;
+    tui.runtime(std::vector<ConsoleStatsSnapshot::Model>{model, model});
+    const auto combined = join(render_tui_stats_panel(tui.snapshot(), 120, 40, false));
+    failures += check(contains(combined, "2 loaded models (combined)") && contains(combined, "IDLE") &&
+                          contains(combined, "80/200 pages") && contains(combined, "4.00/16.00 GiB"),
+                      "router dashboard must combine model gauges and capacities consistently");
 
     // Terminal fitting counts visible columns only and never splits an escape sequence.
     using ninfer::product::fit_terminal_line;

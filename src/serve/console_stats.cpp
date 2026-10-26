@@ -118,6 +118,7 @@ ConsoleRequestSample make_console_request_sample(const GenerationOutcome& outcom
             ? metrics.speculative_backend
             : SpeculativeBackend::None;
     return ConsoleRequestSample{
+        .completion_tokens       = static_cast<std::uint64_t>(std::max(outcome.completion_tokens, 0)),
         .speculative_backend     = backend,
         .ttft_seconds            = metrics.ttft_seconds,
         .prompt_tokens           = prompt_tokens,
@@ -213,13 +214,14 @@ std::vector<std::string> render_console_stats_panel(const ConsoleStatsSnapshot& 
     return lines;
 }
 
-ConsoleStatsPanel::ConsoleStatsPanel(std::shared_ptr<product::TerminalPanel> panel)
-    : panel_(std::move(panel)) {
+ConsoleStatsPanel::ConsoleStatsPanel(std::shared_ptr<product::TerminalPanel> panel, bool tui)
+    : panel_(std::move(panel)), tui_(tui) {
     state_.recent_window = kRecentRequests;
 }
 
-void ConsoleStatsPanel::request_done(const GenerationOutcome& outcome) {
-    const ConsoleRequestSample sample = make_console_request_sample(outcome);
+void ConsoleStatsPanel::request_done(const GenerationOutcome& outcome, std::uint64_t request_id) {
+    ConsoleRequestSample sample = make_console_request_sample(outcome);
+    sample.request_id = request_id;
     std::lock_guard lock(mutex_);
     ++state_.completed;
     if (sample.speculative_backend != SpeculativeBackend::None) {
@@ -230,6 +232,7 @@ void ConsoleStatsPanel::request_done(const GenerationOutcome& outcome) {
     if (recent_.size() > kRecentRequests) { recent_.pop_front(); }
     state_.recent = {};
     for (const ConsoleRequestSample& entry : recent_) { state_.recent.add(entry); }
+    if (tui_) { state_.recent_requests.assign(recent_.begin(), recent_.end()); }
     publish_locked();
 }
 
@@ -268,6 +271,18 @@ void ConsoleStatsPanel::show() {
     publish_locked();
 }
 
+void ConsoleStatsPanel::runtime(std::vector<ConsoleStatsSnapshot::Model> models) {
+    std::lock_guard lock(mutex_);
+    state_.running = 0;
+    state_.waiting = 0;
+    for (const auto& model : models) {
+        *state_.running += model.stats.running_requests;
+        *state_.waiting += model.stats.waiting_requests;
+    }
+    state_.models = std::move(models);
+    publish_locked();
+}
+
 ConsoleStatsSnapshot ConsoleStatsPanel::snapshot() const {
     std::lock_guard lock(mutex_);
     return state_;
@@ -275,7 +290,12 @@ ConsoleStatsSnapshot ConsoleStatsPanel::snapshot() const {
 
 void ConsoleStatsPanel::publish_locked() {
     // Publishing under the statistics lock keeps concurrent updates from drawing out of order.
-    panel_->update(render_console_stats_panel(state_));
+    if (tui_) {
+        const auto size = panel_->size();
+        panel_->update(render_tui_stats_panel(state_, size.columns, size.rows, panel_->colours()));
+    } else {
+        panel_->update(render_console_stats_panel(state_));
+    }
 }
 
 } // namespace ninfer::serve

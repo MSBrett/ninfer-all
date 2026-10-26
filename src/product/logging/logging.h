@@ -72,6 +72,10 @@ private:
 // control and the logger shows info records; redirected output never contains it.
 class TerminalPanel {
 public:
+    struct Size {
+        std::size_t columns = 0;
+        std::size_t rows = 0;
+    };
     ~TerminalPanel();
 
     TerminalPanel(const TerminalPanel&)            = delete;
@@ -80,6 +84,8 @@ public:
     TerminalPanel& operator=(TerminalPanel&&)      = delete;
 
     [[nodiscard]] bool enabled() const noexcept;
+    [[nodiscard]] Size size() const noexcept;
+    [[nodiscard]] bool colours() const noexcept;
     void update(std::vector<std::string> lines);
     void clear() noexcept;
 

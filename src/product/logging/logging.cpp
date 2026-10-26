@@ -299,6 +299,7 @@ public:
     [[nodiscard]] bool interactive() const noexcept { return interactive_; }
 
     [[nodiscard]] bool cursor_control() const noexcept { return cursor_control_; }
+    [[nodiscard]] bool colours() const noexcept { return colour_; }
 
     void update(std::string line) {
         if (!interactive_) { return; }
@@ -535,6 +536,13 @@ TerminalPanel::~TerminalPanel() { impl_->sink->release_panel(); }
 bool TerminalPanel::enabled() const noexcept {
     return impl_->info_enabled && impl_->sink->cursor_control();
 }
+
+TerminalPanel::Size TerminalPanel::size() const noexcept {
+    const auto size = stderr_terminal_size();
+    return {.columns = size.columns, .rows = size.rows};
+}
+
+bool TerminalPanel::colours() const noexcept { return impl_->sink->colours(); }
 
 void TerminalPanel::update(std::vector<std::string> lines) {
     if (enabled()) { impl_->sink->update_panel(std::move(lines)); }

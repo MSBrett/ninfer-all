@@ -373,7 +373,8 @@ Prefill of a 4,463-token prompt, in tok/s:
   model sleeps instead of unloading: two 27B models on one 24 GB RTX 3090 swap in 1.8 s instead of
   an 11.6 s cold load ([several models](docs/serving.md#several-models-router)).
 - `GET /stats` and a [monitoring dashboard](tools/monitor/README.md), request logs with rotation,
-  and an optional compiled-in WebUI.
+  and an optional compiled-in WebUI. `--tui-stats-panel on` adds a compact read-only terminal
+  dashboard for inference, scheduler and cache statistics, without a WebUI build or sidecar.
 
 </details>
 

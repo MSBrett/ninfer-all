@@ -2129,6 +2129,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--log-stats-interval-ms N` | aggregate throughput report interval; `0` disables it | `5000` |
 | `--log-colours on\|off` | `on` colours the console log's levels and gives every statistic of the operational lines a stable colour; `off` keeps the log plain; a redirected stderr is always plain | levels coloured on a console |
 | `--log-stats-panel on\|off` | pin the session statistics panel beneath the console log on an interactive terminal | off |
+| `--tui-stats-panel on\|off` | compact read-only terminal dashboard with recent request percentiles, scheduler, caches and drafting; alternative to the log table, no WebUI needed | off |
 | `--log-level trace\|debug\|info\|warning\|error\|critical\|off` | pretty stderr verbosity | `info` |
 | `--device N` | CUDA device index | `0` |
 | `--devices A,B,...` | one pipeline stage per listed CUDA device (2 to 8; the cards may differ where the build runs on each; see [pipeline stages](maintainer/pipeline-stages.md)); on the Qwen3.5 family MTP, DFlash, DFlash2 and resident or CPU Vision run across the stages (the Vision tower stays on the first device; `--vision-residency overlay` is refused); overrides `--device` | none |
@@ -2341,10 +2342,44 @@ more than ten have completed, one over the last ten:
 The table is 77 columns wide, 86 with the archive column, so it fits a console window snapped to
 half of a 1920-pixel screen; a narrower window cuts the rows at its edge.
 
-Ratios and rates divide summed tokens by summed seconds, so each request weighs by its size. The
-title counts completed, failed, cancelled, and rejected requests and, while throughput reporting is
-enabled, the current running and waiting requests. The panel only reads the same outcomes as the
-`req#N done` records; it changes no request behavior.
+`--tui-stats-panel on` selects a richer terminal dashboard instead of this table. It works in builds
+without an embedded WebUI, needs no sidecar, extra HTTP listener or request-log file, and uses no extra
+dependencies. For example, add it to an existing launch recipe:
+
+```bash
+ninfer-serve models/qwen3_8_27b.ninfer --tui-stats-panel on
+```
+
+The dashboard stays beneath the scrolling log, uses no full-screen/alternate buffer, takes no
+keyboard input, and fits an 80-column, 24-row console without panel scrolling. Narrow or short
+consoles show a compact summary; larger ones show up to three recent completed requests. It adapts
+on the next refresh after resizing. `--log-colours off` keeps its text plain. Like the log table it
+requires an interactive VT-capable stderr and `info` verbosity or more; redirected stderr keeps
+ordinary records with no dashboard or terminal control codes. Enable only one of the two panels.
+
+The headline decode, prefill and TTFT p50/p95 use nearest-rank percentiles over the last ten completed
+requests, excluding decode/prefill phases that did not run. Decode excludes the first token emitted
+by prefill; prefill excludes reused prompt tokens. Prefix hit and drafting acceptance use ratios of
+summed tokens over that same window, with n-gram rounds removed from the named model drafter.
+Unavailable measurements show `--`. Session outcome counts include failures, cancellations and
+rejections; the recent request table contains successful generation outcomes, including any stopped
+early by their normal finish condition. No prompts, generated text or client error messages appear.
+
+Live gauges refresh once a second even with `--log-stats-interval-ms 0`; that option still controls
+only periodic throughput records. Live data uses the Engine's published snapshots and load-time
+capacity facts, without taking its execution lock to inspect memory. It shows running/prefilling/
+decode-ready/waiting requests, ingress, Main KV page occupancy, host retention usage, cumulative
+pressure events, KV/state transfer bytes and occupied state slots. The hybrid host gauge includes
+KV blocks and state snapshots; in legacy mode it describes Host KV alone. The engine tok/s row is
+computed tokens divided by accumulated phase execution time since model load, not wall-clock
+throughput. Router mode combines currently loaded models' gauges and counters; completed-request
+statistics cover the whole server session and survive model unloads. GPU utilization/power and host
+CPU/RAM telemetry and long chart history remain features of the [sidecar monitor](../tools/monitor/README.md).
+
+The `--log-stats-panel` table's ratios and rates divide summed tokens by summed seconds, so each
+request weighs by its size. The title counts completed, failed, cancelled, and rejected requests
+and, while throughput reporting is enabled, the current running and waiting requests. The panel
+only reads the same outcomes as the `req#N done` records; it changes no request behavior.
 
 Pretty values use readable units and rounded rates; use the independent request JSONL for complete
 fields and full precision. Operational records never contain prompts, generated text,

@@ -577,6 +577,30 @@ int main() {
     } catch (const std::invalid_argument&) { invalid_panel_rejected = true; }
     failures +=
         check(invalid_panel_rejected, "--log-stats-panel accepted a value other than on|off");
+    failures += check(!parse({"ninfer-serve", "model.ninfer"}).tui_stats_panel &&
+                          parse({"ninfer-serve", "model.ninfer", "--tui-stats-panel", "on"})
+                              .tui_stats_panel &&
+                          !parse({"ninfer-serve", "model.ninfer", "--tui-stats-panel", "off"})
+                               .tui_stats_panel,
+                      "TUI dashboard must be opt-in with explicit on|off values");
+    const auto tui_only = parse({"ninfer-serve", "model.ninfer", "--tui-stats-panel", "on",
+                                 "--log-stats-interval-ms", "0", "--no-webui"});
+    failures += check(tui_only.tui_stats_panel && !tui_only.enable_webui &&
+                          tui_only.log_stats_interval_ms == 0 && !tui_only.log_stats_panel,
+                      "TUI must be selectable without WebUI or periodic throughput logs");
+    for (const auto& args : std::vector<std::vector<std::string>>{
+             {"ninfer-serve", "model.ninfer", "--tui-stats-panel", "yes"},
+             {"ninfer-serve", "model.ninfer", "--tui-stats-panel"},
+             {"ninfer-serve", "model.ninfer", "--tui-stats-panel", "on", "--log-stats-panel", "on"},
+             {"ninfer-serve", "model.ninfer", "--log-stats-panel", "on", "--tui-stats-panel", "on"}}) {
+        bool rejected = false;
+        try { (void)parse(args); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "invalid or conflicting TUI panel arguments must be rejected");
+    }
+    failures += check(serve_usage_text("ninfer-serve").find("--tui-stats-panel on|off") !=
+                          std::string::npos,
+                      "serve help must advertise the TUI dashboard");
     failures += check(configured.media_cache_bytes == (256ULL << 20) &&
                           configured.media_live_bytes == (512ULL << 20) &&
                           configured.media_preprocess_threads == 6,

@@ -170,6 +170,8 @@ struct ServeOptions {
     std::optional<bool> log_colours;
     // --log-stats-panel on|off: pin the session statistics beneath the console log (terminal only).
     bool log_stats_panel   = false;
+    // --tui-stats-panel on|off: a compact read-only terminal dashboard instead of the log table.
+    bool tui_stats_panel   = false;
     bool enable_webui      = true;  // serve a WebUI compiled in with NINFER_WEBUI_DIR
     // --webui-mcp-proxy: relay the WebUI's MCP traffic at /cors-proxy. It reaches any http host it
     // is given, so it stays off unless asked for by name.
