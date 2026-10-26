@@ -33,6 +33,17 @@ int check(bool condition, const char* message) {
 
 int run_tests() {
     int failures = 0;
+    {
+        const auto defaults = parse({"ninfer-cli", "model.ninfer", "--prompt", "x"});
+        const auto capped = parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
+                                   "--no-fp8-compute", "--mlp-a8-decode", "--prefill-cublas"});
+        failures += check(!defaults.no_fp8_compute && capped.no_fp8_compute &&
+                              capped.mlp_a8_decode && capped.prefill_a8 && capped.prefill_cublas,
+                          "FP8 compute cap was not opt-in or changed integer activation controls");
+        failures += check(!parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
+                                   "--no-prefill-a8"}).no_fp8_compute,
+                          "integer prefill control unexpectedly capped FP8 compute");
+    }
     failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--gpu-clock-floor",
                              "1500"}).gpu_clock_floor_mhz == 1500 &&
                           parse({"ninfer-cli", "model.ninfer", "--prompt", "x"})
@@ -368,6 +379,7 @@ int run_tests() {
                                         "--ngram-draft-tokens",
                                         "--ngram-min-match",
                                         "--no-cuda-graph",
+                                        "--no-fp8-compute",
                                         "--no-prefill-a8",
                                         "--no-prefill-cublas-projections",
                                         "--no-thinking",

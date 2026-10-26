@@ -49,16 +49,14 @@ void launch_fp8_a16_chunks(const Tensor& x, const Weight& weight, Tensor& out,
 template <class Geometry, class Schedule, bool FullTokens>
 void launch_fp8_a8_mma(const Weight& weight, Tensor& out, Fp8A8Workspace workspace,
                        std::int32_t tokens, cudaStream_t stream) {
-#if defined(NINFER_SM8X_COMPAT) && !defined(NINFER_SM120_FP8)
-    // fp8_mma_kernel emits mma.sync...kind::f8f6f4, a Blackwell-only qualifier, so sm_8x must not
-    // instantiate it. A8 is never admitted there (prepare.cpp maps every stored policy to
-    // A16Only); see fp8_sm86_stubs.cpp.
+#if defined(NINFER_SM8X_COMPAT) && !defined(NINFER_SM120_FP8) && !defined(NINFER_SM89_FP8)
+    // This build has neither Ada ordinary FP8 nor Blackwell FP8 MMA units.
     (void)weight;
     (void)out;
     (void)workspace;
     (void)tokens;
     (void)stream;
-    throw std::runtime_error("FP8 A8 execution requires an sm_100a or sm_120a GPU");
+    throw std::runtime_error("FP8 A8 execution requires an sm_89 or sm_120a image");
 #else
     static_assert((Geometry::kOutputRows % Schedule::kBlockRows) == 0);
     static_assert((Geometry::kInputRows % Schedule::kBlockK) == 0);
@@ -74,7 +72,8 @@ void launch_fp8_a8_mma(const Weight& weight, Tensor& out, Fp8A8Workspace workspa
     }
     fp8_mma_kernel<Geometry, Schedule, FullTokens>
         <<<blocks, Schedule::kThreads, Schedule::kSharedBytes, stream>>>(
-            workspace.codes, workspace.scales, static_cast<const std::uint8_t*>(weight.qdata),
+            workspace.codes, workspace.scales, workspace.centers,
+            static_cast<const std::uint8_t*>(weight.qdata),
             static_cast<const __nv_bfloat16*>(weight.scales), tokens, Fp8IdentityEpilogue{},
             output);
     CUDA_CHECK(cudaGetLastError());

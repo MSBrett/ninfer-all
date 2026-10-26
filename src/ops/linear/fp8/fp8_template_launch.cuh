@@ -95,16 +95,15 @@ template <class Schedule, class Output, class Epilogue, class Rows = Fp8Identity
 void launch_fp8_a8_mma(const Fp8A8Operands& p, Output output, Epilogue epilogue,
                        cudaStream_t stream, Rows rows = {},
                        pdl::Dependency dependency = pdl::Dependency::Serialized) {
-#if defined(NINFER_SM8X_COMPAT) && !defined(NINFER_SM120_FP8)
-    // The A8 MMA emits mma.sync...kind::f8f6f4, which sm_8x does not have; A8 is never admitted
-    // there (see fp8_sm86_stubs.cpp).
+#if defined(NINFER_SM8X_COMPAT) && !defined(NINFER_SM120_FP8) && !defined(NINFER_SM89_FP8)
+    // This build has neither Ada ordinary FP8 nor Blackwell FP8 MMA units.
     (void)p;
     (void)output;
     (void)epilogue;
     (void)stream;
     (void)rows;
     (void)dependency;
-    throw std::runtime_error("FP8 A8 execution requires an sm_100a or sm_120a GPU");
+    throw std::runtime_error("FP8 A8 execution requires an sm_89 or sm_120a image");
 #else
     validate_fp8_operands<Schedule>(p);
     if (p.rows % Schedule::kBlockRows || p.k % Schedule::kBlockK ||

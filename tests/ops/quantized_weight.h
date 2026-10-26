@@ -738,9 +738,20 @@ inline double logical_weight_fp64(const PackedWeight& packed, std::int32_t row,
             static_cast<std::size_t>(row_tile * k_tiles + scale_tile) * 512U +
             static_cast<std::size_t>(row_inner % 32) * 16U +
             static_cast<std::size_t>(row_inner / 32) * 4U + static_cast<std::size_t>(scale_lane);
+        const auto divisor_rows = weight.weight_divisor_rows > 0 ? weight.weight_divisor_rows : weight.n;
+        const auto divisor_offset = packed.weight_divisor_offset +
+            static_cast<std::size_t>(row / divisor_rows) * sizeof(float);
+        if (divisor_offset + sizeof(float) > packed.payload.size()) {
+            throw std::invalid_argument("quantized-weight fixture: divisor outside payload");
+        }
+        float divisor = 0.0F;
+        std::memcpy(&divisor, packed.payload.data() + divisor_offset, sizeof(divisor));
+        if (!std::isfinite(divisor) || divisor <= 0.0F) {
+            throw std::invalid_argument("quantized-weight fixture: invalid row divisor");
+        }
         const double decoded = detail::decode_e2m1(code) *
                                detail::decode_e4m3fn(packed.payload[scale_offset]) /
-                               static_cast<double>(weight.weight_scale_divisor);
+                               static_cast<double>(divisor);
         return static_cast<double>(static_cast<float>(decoded));
     }
 

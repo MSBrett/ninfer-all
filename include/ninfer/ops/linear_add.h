@@ -57,7 +57,10 @@ namespace ninfer::ops {
  *
  * Compute policy:
  *   All policies permit the A16 implementations of Q4, Q5, Q8 and BF16. NVFP4 uses A16 for
- *   A16Only/AllowA8 and may use A4 under AllowA4. FP8 may use A8 under AllowA8/AllowA4.
+ *   A16Only, may use Ada FP8 activation compute under AllowA8/AllowA4, and may use native A4
+ *   under AllowA4 on supporting devices. The NVFP4 A8 path keeps its codes exact and applies
+ *   each G16 scale to its FP32 partial product, as in Linear. FP8 may use A8 under
+ *   AllowA8/AllowA4.
  *   Each registration owns its production plan. A permissive policy
  *   allows the private resolver to select either qualified
  *   arithmetic profile; it does not itself prescribe a kernel.

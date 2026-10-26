@@ -57,19 +57,9 @@ inline void cuda_synchronize(cudaStream_t stream) {
     cuda_check(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
 }
 
-// FP8 A8 and NVFP4 A4 execution issue tensor-core instructions that exist only on sm_100a /
-// sm_120a and have no Ampere fallback, so those translation units are compiled out under
-// NINFER_SM8X_COMPAT and their entry points throw instead. A 120a build on that path still
-// compiles both (NINFER_SM120_FP8, NINFER_SM120_NVFP4); a build of several architectures with
-// 120a runs them on the cards that run its 120a code only, and its entry points throw the same
-// refusal on the others (ops/common/blackwell_routes.h).
-inline bool a8_execution_available() {
-#if defined(NINFER_SM8X_COMPAT) && !defined(NINFER_SM120_FP8)
-    return false;
-#else
-    return ops::current_device_blackwell();
-#endif
-}
+// FP8 A8 is available on loaded Ada or Blackwell code. Native NVFP4 A4 remains
+// a separate Blackwell capability; an Ada test must not skip a failed A8 admission.
+inline bool a8_execution_available() { return ops::current_device_fp8(); }
 
 inline bool a4_execution_available() {
 #if defined(NINFER_SM8X_COMPAT) && !defined(NINFER_SM120_NVFP4)
@@ -83,8 +73,15 @@ inline bool a4_execution_available() {
 // not run the code they need. Where those kernels run the answer is always false, so such a throw
 // still fails the test.
 inline bool unsupported_arch_refusal(const std::exception& error) {
-    if (a8_execution_available() && a4_execution_available()) { return false; }
-    return std::string_view(error.what()).find("requires an sm_") != std::string_view::npos;
+    const std::string_view message(error.what());
+    if (message.find("requires an sm_") == std::string_view::npos) { return false; }
+    if (message.find("A8") != std::string_view::npos ||
+        (message.find("FP8") != std::string_view::npos &&
+         message.find("NVFP4") == std::string_view::npos)) {
+        return !a8_execution_available();
+    }
+    if (message.find("A4") != std::string_view::npos) { return !a4_execution_available(); }
+    return !a8_execution_available() && !a4_execution_available();
 }
 
 // Runs one Op test case, reporting an unsupported-architecture refusal as a skip rather than a

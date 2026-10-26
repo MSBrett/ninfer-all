@@ -1,6 +1,8 @@
 #include "core/weight.h"
 #include "ninfer/ops/linear_add.h"
 #include "core/device.h"
+#include "ops/common/device_tier.h"
+#include "ops/common/device_route.h"
 
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
@@ -28,6 +30,7 @@ constexpr ReductionCriterion kA16Tolerance{
     2.0 * kBf16UnitRoundoff,
 };
 constexpr ReductionCriterion kA4Tolerance{0.16, kBf16UnitRoundoff, 0.16};
+constexpr ReductionCriterion kA8Tolerance{0.04, kBf16UnitRoundoff, 0.06};
 
 struct Invocation {
     std::int32_t tokens;
@@ -89,8 +92,12 @@ int verify_preserved(const GuardedDeviceBuffer& device, std::span<const std::uin
 }
 
 int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
+    // Force the candidate for AllowA8 cases; A16Only still exercises the
+    // optimized fused A16 route and retains its stricter oracle criterion.
+    const ops::DeviceRouteForce candidate(
+        "nvfp4_linear_add/"+std::to_string(n)+"x"+std::to_string(k),"a8");
     const std::int32_t first_a4 = k == 6144 ? 7 : 8;
-    const std::array invocations{
+    const std::vector<Invocation> invocations{
         Invocation{1, ops::LinearPolicy::A16Only},
         Invocation{4, ops::LinearPolicy::A16Only},
         Invocation{5, ops::LinearPolicy::A16Only},
@@ -108,6 +115,7 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
         Invocation{128, ops::LinearPolicy::A16Only},
         Invocation{129, ops::LinearPolicy::A16Only},
         Invocation{1024, ops::LinearPolicy::A16Only},
+        Invocation{1025, ops::LinearPolicy::A16Only},
         Invocation{first_a4, ops::LinearPolicy::AllowA4},
         Invocation{17, ops::LinearPolicy::AllowA4},
         Invocation{8, ops::LinearPolicy::AllowA4},
@@ -123,6 +131,19 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
         Invocation{1023, ops::LinearPolicy::AllowA4},
         Invocation{1024, ops::LinearPolicy::AllowA4},
         Invocation{1025, ops::LinearPolicy::AllowA4},
+        Invocation{1, ops::LinearPolicy::AllowA8},
+        Invocation{3, ops::LinearPolicy::AllowA8},
+        Invocation{8, ops::LinearPolicy::AllowA8},
+        Invocation{16, ops::LinearPolicy::AllowA8},
+        Invocation{17, ops::LinearPolicy::AllowA8},
+        Invocation{32, ops::LinearPolicy::AllowA8},
+        Invocation{33, ops::LinearPolicy::AllowA8},
+        Invocation{64, ops::LinearPolicy::AllowA8},
+        Invocation{65, ops::LinearPolicy::AllowA8},
+        Invocation{128, ops::LinearPolicy::AllowA8},
+        Invocation{129, ops::LinearPolicy::AllowA8},
+        Invocation{1024, ops::LinearPolicy::AllowA8},
+        Invocation{1025, ops::LinearPolicy::AllowA8},
     };
     // The invocation list is what drives the host buffers, so take the bound from it rather than
     // from a literal that silently caps it.
@@ -150,6 +171,9 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
 
     int failures = 0;
     for (const Invocation invocation : invocations) {
+        if (invocation.policy == ops::LinearPolicy::AllowA8 && !ops::current_device_ada_fp8()) {
+            continue;
+        }
         const std::size_t output_words = static_cast<std::size_t>(n) * invocation.tokens;
         GuardedDeviceBuffer output(output_words * sizeof(std::uint16_t));
         output.copy_from_host(initial_residual.data(), output.bytes());
@@ -162,13 +186,16 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
             ops::linear_add(x, weight, residual, invocation.policy, workspace, nullptr);
             cuda_check(cudaDeviceSynchronize(), "synchronize NVFP4 linear_add");
         } catch (const std::exception& error) {
-            if (!unsupported_arch_refusal(error)) { throw; }
+            if (invocation.policy == ops::LinearPolicy::AllowA8 ||
+                !unsupported_arch_refusal(error)) { throw; }
             std::cout << "SKIP NVFP4 linear_add T=" << invocation.tokens << ": "
                       << error.what() << "\n";
             continue;
         }
 
-        if (invocation.tokens == 128) {
+        if (invocation.tokens == 128 ||
+            (invocation.policy == ops::LinearPolicy::AllowA8 &&
+             (invocation.tokens == 1 || invocation.tokens == 65 || invocation.tokens == 1025))) {
             cudaStream_t stream;
             cudaGraph_t graph;
             cudaGraphExec_t executable;
@@ -189,8 +216,9 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
         }
 
         const bool a4           = invocation.policy == ops::LinearPolicy::AllowA4;
+        const bool a8           = invocation.policy == ops::LinearPolicy::AllowA8;
         const std::string label = "NVFP4 linear_add [" + std::to_string(n) + "," +
-                                  std::to_string(k) + "] " + (a4 ? "A4" : "A16") +
+                                  std::to_string(k) + "] " + (a4 ? "A4" : a8 ? "A8" : "A16") +
                                   " T=" + std::to_string(invocation.tokens);
         if (workspace.peak_used() != capacity) {
             std::cerr << label << ": workspace query/execution high-water mismatch\n";
@@ -222,7 +250,7 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
                 expected.push_back(sum + static_cast<double>(bf16_to_f32(initial_residual[index])));
             }
         }
-        failures += verify_reduction(label, actual, expected, a4 ? kA4Tolerance : kA16Tolerance);
+        failures += verify_reduction(label, actual, expected, a4 ? kA4Tolerance : a8 ? kA8Tolerance : kA16Tolerance);
     }
 
     failures += device_activation.verify_guards("NVFP4 linear_add activation");
@@ -238,16 +266,20 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
 
 // A residual that nearly cancels the product exposes how scale and add are rounded. The A4
 // kernels scale under a live-column predicate, so a compiler-chosen MUL+ADD contraction made a
-// column's result depend on how many tokens shared its tile. Every A4 width must give the same
-// column, bit for bit.
+// column's result depend on how many tokens shared its tile. Every native A4 width must give the
+// same column bit for bit. Ada A16 has distinct SIMT/MMA scaling orders, so it requires parity
+// between all identical columns within each call, including partial tiles, and its strict oracle.
 int check_residual_cancellation(std::int32_t k) {
     constexpr std::int32_t n = 5120, max_tokens = 1025;
+    const bool a16=ops::current_device_ada_fp8();
+    const auto policy=a16 ? ops::LinearPolicy::A16Only : ops::LinearPolicy::AllowA4;
     quantized_weight::PatternedWeightOptions options;
     options.weight_scale_divisor = 0.13F;
     options.input_scale_divisor  = 1.0F;
     auto packed = quantized_weight::make_patterned_weight(QType::NVFP4, n, k, 823U, options);
-    // A single nonzero product per row is exactly representable before global scaling, so every
-    // A4 kernel reduces it to the same accumulator whatever its K order.
+    // A single nonzero product per row is exact before global scaling. Native A4 uses one
+    // scaling order. A16 SIMT scales each weight first, whereas MMA scales the complete sum:
+    // this fixture yields respectively 0 and 2.3469329e-7 versus FP64 2.5790472e-7 after Add.
     std::fill_n(packed.payload.begin(), static_cast<std::size_t>(n) * k / 2, 0);
     std::fill_n(packed.payload.begin() + static_cast<std::ptrdiff_t>(packed.scale_plane_offset),
                 packed.scale_plane_bytes, 0);
@@ -279,8 +311,8 @@ int check_residual_cancellation(std::int32_t k) {
     GuardedDeviceBuffer device_input(input.size() * sizeof(std::uint16_t));
     device_input.copy_from_host(input.data(), device_input.bytes());
 
-    // Only A4 widths: below 17 (K=6144) or 8 (K=17408) a route table may choose A16, whose
-    // rounding is a different, independently qualified contract.
+    // Native A4 widths, plus Ada's explicit A16 comparison over the same useful tile/tail
+    // boundaries. Low-T SIMT and wide MMA may round differently near cancellation.
     std::vector<std::int32_t> widths;
     for (std::int32_t t = k == 6144 ? 17 : 8; t <= 48; ++t) { widths.push_back(t); }
     for (const std::int32_t t : {49, 63, 64, 65, 127, 128, 129, 191, 192, 193, 383, 384, 385, 511,
@@ -295,12 +327,13 @@ int check_residual_cancellation(std::int32_t k) {
         Tensor x(device_input.data(), DType::BF16, {k, t});
         Tensor residual(output.data(), DType::BF16, {n, t});
         const std::size_t capacity = ops::linear_add_workspace_capacity_bytes(
-            QType::NVFP4, n, k, ops::LinearPolicy::AllowA4, t, t);
+            QType::NVFP4, n, k, policy, t, t);
         WorkspaceArena workspace(std::max<std::size_t>(capacity, 256));
         const std::string label =
-            "NVFP4 residual cancellation K=" + std::to_string(k) + " T=" + std::to_string(t);
+            std::string("NVFP4 ")+(a16 ? "A16" : "A4")+
+            " residual cancellation K=" + std::to_string(k) + " T=" + std::to_string(t);
         try {
-            ops::linear_add(x, weight, residual, ops::LinearPolicy::AllowA4, workspace, nullptr);
+            ops::linear_add(x, weight, residual, policy, workspace, nullptr);
             cuda_check(cudaDeviceSynchronize(), "synchronize cancellation LinearAdd");
         } catch (const std::exception& error) {
             if (!unsupported_arch_refusal(error)) { throw; }
@@ -309,7 +342,7 @@ int check_residual_cancellation(std::int32_t k) {
         }
         std::vector<std::uint16_t> actual(static_cast<std::size_t>(n) * t);
         output.copy_to_host(actual.data(), output.bytes());
-        if (reference.empty()) { reference.assign(actual.begin(), actual.begin() + n); }
+        if (reference.empty() || a16) { reference.assign(actual.begin(), actual.begin() + n); }
         bool equal = true;
         for (std::size_t i = 0; i < actual.size(); ++i) { equal &= actual[i] == reference[i % n]; }
         if (!equal) {
@@ -318,7 +351,7 @@ int check_residual_cancellation(std::int32_t k) {
         }
         std::vector<double> observed(n);
         for (std::int32_t row = 0; row < n; ++row) { observed[row] = bf16_to_f32(actual[row]); }
-        failures += verify_reduction(label, observed, oracle, kA4Tolerance);
+        failures += verify_reduction(label, observed, oracle, a16 ? kA16Tolerance : kA4Tolerance);
         failures += output.verify_guards(label);
     }
     failures += device_input.verify_guards("cancellation input");

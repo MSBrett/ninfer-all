@@ -32,6 +32,11 @@ void fp8_attn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor&
 void fp8_attn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                               Tensor& k, Tensor& v, Fp8A8Workspace workspace, cudaStream_t stream);
 
+void fp8_attn_input_a8_prequantized_launch(const Tensor& x, const Weight& weight, Tensor& q,
+                                           Tensor& gate, Tensor& k, Tensor& v,
+                                           Fp8A8Workspace workspace, cudaStream_t stream);
+[[nodiscard]] bool fp8_attn_input_uses_a8(LinearPolicy policy, std::int32_t tokens);
+
 void fp8_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                              Tensor& k, Tensor& v, LinearPolicy policy, WorkspaceArena* workspace,
                              cudaStream_t stream);

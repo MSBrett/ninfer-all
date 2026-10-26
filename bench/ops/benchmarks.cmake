@@ -42,6 +42,8 @@ ninfer_add_op_bench(ninfer_gdn_input_proj_conv_snapshot_bench
 ninfer_add_op_bench(ninfer_q4_q5_gdn_input_schedule_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/q4_q5_gdn_input_schedule_bench.cu")
 ninfer_add_op_bench(ninfer_attn_input_proj_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/attn_input_proj_bench.cu")
+ninfer_add_op_bench(ninfer_attn_input_proj_fused_rmsnorm_fp8_bench
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/attn_input_proj_fused_rmsnorm_fp8_bench.cu")
 ninfer_add_op_bench(ninfer_q4_q5_attn_input_schedule_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/q4_q5_attn_input_schedule_bench.cu")
 ninfer_add_op_bench(ninfer_q8_linear_swiglu_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/q8_linear_swiglu_bench.cu")

@@ -46,6 +46,8 @@ void launch_fp8_a8(const Tensor& x, const Weight& w, Tensor& out, Fp8A8Workspace
 template <class Geometry, class Schedule>
 void launch_fp8_a8_tma(const Tensor& x, const Weight& w, Tensor& out, Fp8A8Workspace scratch,
                        cudaStream_t stream) {
+    if (current_device_ada_fp8())
+        return launch_fp8_a8<Geometry, Fp8A8T64R128K128>(x, w, out, scratch, stream);
     launch_fp8_a8_quantize(x, w, scratch, stream);
     launch_fp8_a8_tma_mma<Fp8ScheduleInstance<Schedule, Geometry::kInputRows>>(
         fp8_a8_operands(w, scratch, x.ne[1]),

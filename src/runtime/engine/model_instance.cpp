@@ -670,7 +670,7 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
     StartupPhaseScope binding(options.startup_observer, StartupPhase::TargetPlan);
     auto plan =
         models::qwen3_5::plan_load(reader, models::load_options(options), options.artifact_path,
-                                   models::qwen3_5::rank_tiers(device));
+                                   models::qwen3_5::rank_capabilities(device));
     binding.complete();
     auto model = models::qwen3_5::materialize_model(
         std::move(plan), device, &options.startup_observer,

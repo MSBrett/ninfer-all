@@ -554,6 +554,91 @@ void attn_input_proj_fused_rmsnorm_nvfp4(const Tensor& residual, const Tensor& n
                                                   gate, k, v, workspace, stream);
 }
 
+bool attn_input_proj_fused_rmsnorm_fp8_eligible(const Weight& weight, LinearPolicy policy,
+                                               std::int32_t tokens) {
+    return weight.qtype == QType::FP8_E4M3FN_ROW_BF16 &&
+           weight.layout == QuantLayout::RowScale && weight.n == 14336 && weight.k == 5120 &&
+           detail::fp8_attn_input_fused_rmsnorm_eligible(policy, tokens);
+}
+
+void attn_input_proj_fused_rmsnorm_fp8(const Tensor& input, const Tensor& norm_weight, float eps,
+                                      const Weight& projection_weight, Tensor& q, Tensor& gate,
+                                      Tensor& k, Tensor& v, LinearPolicy policy,
+                                      WorkspaceArena& workspace, cudaStream_t stream,
+                                      const Tensor* residual, Tensor* residual_sum) {
+    const std::int32_t tokens = input.ne[1];
+    if (!attn_input_proj_fused_rmsnorm_fp8_eligible(projection_weight, policy, tokens)) {
+        throw std::invalid_argument("fused FP8 rmsnorm attention: unsupported route");
+    }
+    if (!(eps > 0.0F) || !std::isfinite(eps)) {
+        throw std::invalid_argument("fused FP8 rmsnorm attention: eps must be positive and finite");
+    }
+    require_matrix(input, 5120, tokens, "input");
+    require_matrix(norm_weight, 5120, 1, "norm weight");
+    require_matrix(q, 6144, tokens, "q");
+    require_matrix(gate, 6144, tokens, "gate");
+    require_matrix(k, 1024, tokens, "k");
+    require_matrix(v, 1024, tokens, "v");
+    if (residual != nullptr) { require_matrix(*residual, 5120, tokens, "residual"); }
+    if (residual_sum != nullptr) {
+        if (residual == nullptr) {
+            throw std::invalid_argument("fused FP8 rmsnorm attention: residual_sum needs residual");
+        }
+        require_matrix(*residual_sum, 5120, tokens, "residual sum");
+    }
+    const auto geometry = detail::validate_fp8_weight(projection_weight,
+                                                      "fused FP8 rmsnorm attention");
+    const auto overlap = [](const void* lhs, std::size_t lhs_bytes,
+                            const void* rhs, std::size_t rhs_bytes) {
+        if (lhs == nullptr || rhs == nullptr || lhs_bytes == 0 || rhs_bytes == 0) { return false; }
+        const auto l = reinterpret_cast<std::uintptr_t>(lhs);
+        const auto r = reinterpret_cast<std::uintptr_t>(rhs);
+        return l <= r ? r - l < lhs_bytes : l - r < rhs_bytes;
+    };
+    const std::size_t scratch_bytes = attn_input_proj_workspace_capacity_bytes(
+        projection_weight.qtype, projection_weight.n, projection_weight.k, policy, tokens, tokens);
+    const std::size_t used = workspace.used();
+    const std::size_t padding = (256 - used % 256) % 256;
+    if (used > workspace.capacity() || padding > workspace.capacity() - used ||
+        scratch_bytes > workspace.capacity() - used - padding) {
+        throw std::invalid_argument("fused FP8 rmsnorm attention: insufficient workspace");
+    }
+    const auto* scratch = static_cast<const std::byte*>(workspace.base()) + used + padding;
+    const std::array<const Tensor*, 3> inputs{&input, &norm_weight, residual};
+    const std::array<const Tensor*, 5> outputs{&q, &gate, &k, &v, residual_sum};
+    const auto require_storage_disjoint = [&](const Tensor& tensor) {
+        if (overlap(tensor.data, tensor.bytes(), scratch, scratch_bytes) ||
+            overlap(tensor.data, tensor.bytes(), projection_weight.qdata,
+                    geometry.code_plane_bytes) ||
+            overlap(tensor.data, tensor.bytes(), projection_weight.scales,
+                    geometry.scale_plane_bytes)) {
+            throw std::invalid_argument("fused FP8 rmsnorm attention: tensor overlaps weight or scratch");
+        }
+    };
+    for (const Tensor* tensor : inputs) {
+        if (tensor != nullptr) { require_storage_disjoint(*tensor); }
+    }
+    for (std::size_t i = 0; i < outputs.size(); ++i) {
+        if (outputs[i] == nullptr) { continue; }
+        require_storage_disjoint(*outputs[i]);
+        for (const Tensor* tensor : inputs) {
+            if (tensor != nullptr && overlap(outputs[i]->data, outputs[i]->bytes(),
+                                             tensor->data, tensor->bytes())) {
+                throw std::invalid_argument("fused FP8 rmsnorm attention: output overlaps input");
+            }
+        }
+        for (std::size_t j = 0; j < i; ++j) {
+            if (outputs[j] != nullptr && overlap(outputs[i]->data, outputs[i]->bytes(),
+                                                 outputs[j]->data, outputs[j]->bytes())) {
+                throw std::invalid_argument("fused FP8 rmsnorm attention: outputs overlap");
+            }
+        }
+    }
+    detail::fp8_attn_input_fused_rmsnorm_dispatch(input, norm_weight, eps, projection_weight, q,
+                                                 gate, k, v, policy, workspace, stream,
+                                                 residual, residual_sum);
+}
+
 void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight, Tensor& q,
                      Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream) {
     dispatch_single_parent(x, query_key_gate_value_weight, q, gate, k, v, LinearPolicy::A16Only,

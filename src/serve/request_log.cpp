@@ -824,6 +824,7 @@ std::string format_server_start_json(
          engine_options.suspend.weights == SuspendWeightSource::Host ? "host" : "artifact"},
         {"auto_resume", engine_options.suspend.auto_resume},
         {"mlp_a8_decode", engine_options.mlp_a8_decode},
+        {"no_fp8_compute", engine_options.no_fp8_compute},
         {"prefill_a8", engine_options.prefill_a8},
         {"prefix_reuse", options.allow_prefix_reuse},
         {"speculative_backend",

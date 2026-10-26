@@ -12,6 +12,8 @@
 #include "ninfer/ops/linear.h"
 
 #include "core/device.h"
+#include "ops/common/device_route.h"
+#include "ops/common/device_tier.h"
 #include "direct_bf16_weight.cuh"
 #include "ninfer_bench_common.h"
 #include "quantized_weight.cuh"
@@ -31,6 +33,7 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -114,6 +117,7 @@ struct Options {
     int graph_calls     = 1;
     QType qtype         = QType::Q4_G64_FP16;
     LinearPolicy policy = LinearPolicy::A16Only;
+    std::string activation_route = "auto";
     std::int32_t n      = 0;
     std::int32_t k      = 0;
     std::int32_t t      = 0;
@@ -150,6 +154,7 @@ struct Result {
     std::string labels;
     const char* qtype_name         = "";
     const char* policy_name        = "";
+    std::string activation_route;
     std::int32_t n                 = 0;
     std::int32_t k                 = 0;
     std::int32_t t                 = 0;
@@ -383,6 +388,7 @@ void usage(const char* argv0) {
                  "  random blocks.\n\n"
                  "Options:\n"
                  "  --policy a16|a8|a4|a8int Activation-compute policy (default a16).\n"
+                 "  --activation-route auto|a16|a8  Ada FP8/NVFP4 candidate (default auto).\n"
                  "  --execution MODE   eager (default) or graph; time the complete Op.\n"
                  "  --graph-calls N    Calls per timed graph (1..64, default 1); report per call.\n"
                  "  --profile          Capture exactly one post-warmup public Linear call.\n"
@@ -407,6 +413,11 @@ Options parse_args(int argc, char** argv) {
             opt.have_qtype = true;
         } else if (arg == "--policy") {
             opt.policy = parse_policy(next("policy"));
+        } else if (arg == "--activation-route") {
+            opt.activation_route = lower(next("activation route"));
+            if (opt.activation_route != "auto" && opt.activation_route != "a16" &&
+                opt.activation_route != "a8")
+                throw std::invalid_argument("activation-route must be auto, a16, or a8");
         } else if (arg == "--n") {
             opt.n      = parse_i32(next("N"), "N");
             opt.have_n = true;
@@ -479,6 +490,14 @@ Options parse_args(int argc, char** argv) {
     }
     if (opt.profile && !opt.csv_out.empty()) {
         throw std::invalid_argument("--profile does not write timing CSV");
+    }
+    if (opt.activation_route != "auto") {
+        const bool candidate = opt.qtype == QType::NVFP4 ||
+            (opt.qtype == QType::FP8_E4M3FN_ROW_BF16 && opt.n == 5120 && opt.k == 6144);
+        if (opt.have_suite || !candidate)
+            throw std::invalid_argument("activation-route requires explicit NVFP4 or FP8 5120x6144");
+        if (opt.activation_route == "a8" && !ops::allows_a8(opt.policy))
+            throw std::invalid_argument("activation-route a8 requires an A8-permitting policy");
     }
     return opt;
 }
@@ -648,7 +667,11 @@ double registered_tensor_peak_tflops(const BenchPoint& point, const char*& profi
         (point.n == 14336 && point.k == 5120) || (point.n == 16384 && point.k == 5120) ||
         (point.n == 34816 && point.k == 5120) || (point.n == 5120 && point.k == 6144) ||
         (point.n == 5120 && point.k == 17408);
-    const bool fp8_tensor_route =
+    const bool fp8_tensor_route = point.qtype == QType::FP8_E4M3FN_ROW_BF16 &&
+                                 ops::current_device_ada_fp8()
+        ? ops::linear_workspace_capacity_bytes(point.qtype, point.n, point.k, point.policy,
+                                               point.t, point.t) != 0
+        :
         (point.n == 14336 && point.k == 5120 && point.t >= 12) ||
         (point.n == 16384 && point.k == 5120 && point.t >= 11) ||
         (point.n == 34816 && point.k == 5120 && (point.t == 1 || point.t >= 5)) ||
@@ -701,6 +724,7 @@ Result make_result(const BenchPoint& point, const LinearBenchWeight& weight,
     result.labels             = join_labels(point.labels);
     result.qtype_name         = qtype_name(point.qtype);
     result.policy_name        = policy_name(point.policy);
+    result.activation_route   = opt.activation_route;
     result.n                  = point.n;
     result.k                  = point.k;
     result.t                  = point.t;
@@ -732,6 +756,18 @@ Result make_result(const BenchPoint& point, const LinearBenchWeight& weight,
     return result;
 }
 
+std::unique_ptr<ops::DeviceRouteForce> force_activation_route(
+    QType qtype, std::int32_t n, std::int32_t k, std::int32_t min_t, const Options& opt) {
+    if (opt.activation_route == "auto") return {};
+    if (!ops::current_device_ada_fp8())
+        throw std::invalid_argument("activation-route candidates require a native sm_89 FP8 image");
+    if (qtype == QType::FP8_E4M3FN_ROW_BF16 && opt.activation_route == "a8" && min_t < 17)
+        throw std::invalid_argument("FP8 5120x6144 A8 candidate requires T >= 17");
+    const auto prefix = qtype == QType::NVFP4 ? "nvfp4_linear/" : "fp8_linear/";
+    return std::make_unique<ops::DeviceRouteForce>(
+        prefix + std::to_string(n) + "x" + std::to_string(k), opt.activation_route);
+}
+
 std::vector<Result> run_group(const PointGroup& group, const Options& opt, DeviceBuffer& flush,
                               cudaStream_t stream) {
     const std::int32_t max_t =
@@ -742,6 +778,7 @@ std::vector<Result> run_group(const PointGroup& group, const Options& opt, Devic
         std::min_element(group.points.begin(), group.points.end(),
                          [](const BenchPoint& a, const BenchPoint& b) { return a.t < b.t; })
             ->t;
+    const auto candidate = force_activation_route(group.qtype, group.n, group.k, min_t, opt);
     const std::uint64_t x_elements =
         checked_mul(static_cast<std::uint64_t>(group.k), max_t, "activation allocation");
     const std::uint64_t out_elements =
@@ -799,6 +836,7 @@ std::vector<Result> run_group(const PointGroup& group, const Options& opt, Devic
 
 void run_profile(const BenchPoint& point, const Options& opt, DeviceBuffer& flush,
                  cudaStream_t stream) {
+    const auto candidate = force_activation_route(point.qtype, point.n, point.k, point.t, opt);
     const std::uint64_t x_elements =
         checked_mul(static_cast<std::uint64_t>(point.k), point.t, "activation allocation");
     const std::uint64_t out_elements =
@@ -856,6 +894,8 @@ void run_profile(const BenchPoint& point, const Options& opt, DeviceBuffer& flus
 void print_header(const Options& opt) {
     std::printf("# execution=%s graph_calls=%d cuda_runtime=%d\n", opt.graph ? "graph" : "eager",
                 opt.graph_calls, CUDART_VERSION);
+    std::printf("# activation_route=%s (auto follows production policy dispatch)\n",
+                opt.activation_route.c_str());
     int device = 0;
     CUDA_CHECK(cudaGetDevice(&device));
     cudaDeviceProp properties{};
@@ -926,7 +966,7 @@ void write_csv(const std::filesystem::path& path, const std::vector<Result>& res
            "sustained_read_gbs,sustained_read_pct,useful_tflops,tensor_profile,"
            "tensor_peak_tflops,tensor_peak_pct,memory_floor_us,memory_floor_pct,"
            "t1_linear_extrapolation,delta_pct,"
-           "warmup,repeat,flush_bytes,execution,graph_nodes,graph_calls\n";
+           "warmup,repeat,flush_bytes,execution,graph_nodes,graph_calls,activation_route\n";
     for (const Result& result : results) {
         out << csv_quote(result.labels) << ',' << result.qtype_name << ',' << result.policy_name
             << ',' << result.n << ',' << result.k << ',' << result.t << ',' << result.weight_bytes
@@ -948,7 +988,7 @@ void write_csv(const std::filesystem::path& path, const std::vector<Result>& res
         out << ',' << result.warmup << ',' << result.repeat << ',' << result.flush_bytes << ','
             << result.execution << ',';
         if (result.graph_nodes) out << result.graph_nodes;
-        out << ',' << result.graph_calls << '\n';
+        out << ',' << result.graph_calls << ',' << result.activation_route << '\n';
     }
 }
 

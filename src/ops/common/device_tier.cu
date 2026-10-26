@@ -36,7 +36,7 @@ std::array<std::atomic<std::uint8_t>, kMaxDevices>& known_tiers() {
     return tiers;
 }
 
-DeviceTier probe(int device) {
+int probe_ptx(int device) {
     int previous = 0;
     if (cudaGetDevice(&previous) != cudaSuccess) {
         cudaGetLastError();
@@ -51,7 +51,7 @@ DeviceTier probe(int device) {
         throw std::runtime_error("CUDA device " + std::to_string(device) +
                                  " runs none of this build's code: " + cudaGetErrorName(err));
     }
-    return tier_of_ptx(attributes.ptxVersion);
+    return attributes.ptxVersion;
 }
 
 } // namespace
@@ -61,11 +61,11 @@ DeviceTier device_tier(int device) {
         (void)device;
         return only_built_tier();
     } else {
-        if (device < 0 || device >= kMaxDevices) { return probe(device); }
+        if (device < 0 || device >= kMaxDevices) { return tier_of_ptx(probe_ptx(device)); }
         std::atomic<std::uint8_t>& slot = known_tiers()[static_cast<std::size_t>(device)];
         const std::uint8_t known        = slot.load(std::memory_order_relaxed);
         if (known != 0) { return static_cast<DeviceTier>(known - 1); }
-        const DeviceTier tier = probe(device);
+        const DeviceTier tier = tier_of_ptx(probe_ptx(device));
         slot.store(static_cast<std::uint8_t>(static_cast<std::uint8_t>(tier) + 1),
                    std::memory_order_relaxed);
         return tier;
@@ -83,6 +83,28 @@ DeviceTier current_device_tier() {
         }
         return device_tier(device);
     }
+}
+
+bool device_ada_fp8(int device) {
+    if constexpr (!kBuildAdaFp8) { return false; }
+    static std::array<std::atomic<std::uint8_t>, kMaxDevices> capabilities{};
+    if (device < 0 || device >= kMaxDevices) { return probe_ptx(device) == 89; }
+    auto& slot = capabilities[static_cast<std::size_t>(device)];
+    const auto known = slot.load(std::memory_order_relaxed);
+    if (known != 0) { return known == 2; }
+    const bool supported = probe_ptx(device) == 89;
+    slot.store(supported ? 2 : 1, std::memory_order_relaxed);
+    return supported;
+}
+
+bool current_device_ada_fp8() {
+    if constexpr (!kBuildAdaFp8) { return false; }
+    int device = 0;
+    const auto error = cudaGetDevice(&device);
+    if (error != cudaSuccess) {
+        throw std::runtime_error(std::string("FP8 device query: ") + cudaGetErrorName(error));
+    }
+    return device_ada_fp8(device);
 }
 
 } // namespace ninfer::ops

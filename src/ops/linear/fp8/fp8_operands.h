@@ -17,6 +17,7 @@ struct Fp8A16Operands {
 struct Fp8A8Operands {
     const std::uint8_t* x;
     const float* x_scales;
+    const float* x_centers;
     const std::uint8_t* codes;
     const __nv_bfloat16* scales;
     int rows, k, tokens;
@@ -34,6 +35,7 @@ inline Fp8A16Operands fp8_a16_operands(const Tensor& x, const Weight& w) {
 inline Fp8A8Operands fp8_a8_operands(const Weight& w, Fp8A8Workspace x, int tokens) {
     return {x.codes,
             x.scales,
+            x.centers,
             static_cast<const std::uint8_t*>(w.qdata),
             static_cast<const __nv_bfloat16*>(w.scales),
             w.n,

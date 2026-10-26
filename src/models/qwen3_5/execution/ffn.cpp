@@ -16,6 +16,14 @@
 namespace ninfer::models::qwen3_5::execution {
 namespace {
 
+// Native Q8 MTP uses the same fused profiles as the other Q8 FFNs. Keep the
+// materialized path for representations without those paired registrations.
+bool materialized_dense(const DenseParameters& p, bool mtp) {
+    return p.gate_up.weight.qtype == QType::Q6_G64_FP16 ||
+           (mtp && (p.gate_up.weight.qtype != QType::Q8_G32_FP16 ||
+                    p.down.weight.qtype != QType::Q8_G32_FP16));
+}
+
 bool rotated_dense(const DenseParameters& p) {
     return rotated(p.gate_up.hadamard_signs) || rotated(p.down.hadamard_signs);
 }
@@ -116,7 +124,7 @@ std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t fi
         return layout.peak_bytes(1);
     }
     WorkspaceLayoutBuilder layout;
-    if (mtp || gu.qtype == QType::Q6_G64_FP16) {
+    if (materialized_dense(p, mtp)) {
         (void)layout.alloc(DType::BF16, {gu.n, last});
         {
             auto scope = layout.scope();
@@ -229,7 +237,7 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
         ops::linear_add(activation, down, residual, p.down.policy, workspace, stream);
         return;
     }
-    if (mtp || gu.qtype == QType::Q6_G64_FP16) {
+    if (materialized_dense(p, mtp)) {
         Tensor gate_up = workspace.alloc(DType::BF16, {gu.n, columns});
         {
             auto call = workspace.scope();

@@ -51,6 +51,7 @@ void launch_a8(const Tensor& x, const Weight& weight, Tensor& out, Fp8A8Workspac
 bool uses_a8(std::int32_t, std::int32_t max_tokens) { return max_tokens >= 17; }
 
 std::size_t partial_capacity_bytes(std::int32_t max_tokens) {
+    if (current_device_ada_fp8()) return 0;
     // Up to three 128-token tiles occupy 168 CTAs and do not need split-K.
     return max_tokens > 384 ? Bulk::kPartialBytes : 0;
 }

@@ -41,7 +41,8 @@ void launch_mma(const Weight& weight, Tensor& q, Tensor& gate, Tensor& k, Tensor
         {dim3(blocks), dim3(Schedule::kThreads), Schedule::kSharedBytes, stream},
         fp8_mma_kernel<Geometry, Schedule, FullTokens, Fp8IdentityEpilogue,
                        Fp8AttentionInputOutput>,
-        workspace.codes, workspace.scales, static_cast<const std::uint8_t*>(weight.qdata),
+        workspace.codes, workspace.scales, workspace.centers,
+        static_cast<const std::uint8_t*>(weight.qdata),
         static_cast<const __nv_bfloat16*>(weight.scales), tokens, Fp8IdentityEpilogue{}, output,
         Fp8MmaIdentityRows{}));
 }
@@ -60,6 +61,12 @@ void fp8_attn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& q, 
                               Tensor& k, Tensor& v, Fp8A8Workspace workspace, cudaStream_t stream) {
     require_fp8_a8_card();
     launch_fp8_a8_quantize(x, weight, workspace, stream);
+    fp8_attn_input_a8_prequantized_launch(x, weight, q, gate, k, v, workspace, stream);
+}
+
+void fp8_attn_input_a8_prequantized_launch(const Tensor& x, const Weight& weight, Tensor& q,
+                                           Tensor& gate, Tensor& k, Tensor& v,
+                                           Fp8A8Workspace workspace, cudaStream_t stream) {
     // This Op owns its tile choices; the generic Linear schedules do not describe four-output
     // projection's short-column cost. All variants share the same activation representation.
     using Small32   = Fp8MmaSchedule<32, 64, 128, 1, 2, 3, 2, Cache::cg, Cache::cg,

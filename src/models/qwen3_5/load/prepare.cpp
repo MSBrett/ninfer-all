@@ -13,7 +13,6 @@
 #include <vector>
 
 namespace ninfer::models::qwen3_5::loading {
-#if defined(NINFER_SM8X_COMPAT)
 namespace {
 
 #    if defined(NINFER_SM120_NVFP4)
@@ -21,7 +20,7 @@ constexpr bool kNvfp4A4Built = true;
 #    else
 constexpr bool kNvfp4A4Built = false;
 #    endif
-#    if defined(NINFER_SM120_FP8)
+#    if defined(NINFER_SM120_FP8) || defined(NINFER_SM89_FP8)
 constexpr bool kFp8A8Built = true;
 #    else
 constexpr bool kFp8A8Built = false;
@@ -39,33 +38,42 @@ bool keeps_permission(const artifact::Binder& binder, const artifact::ParameterR
                       ops::LinearPolicy policy) {
     switch (policy) {
     case ops::LinearPolicy::AllowA4:
-        return kNvfp4A4Built && stored_as(binder, reference, QType::NVFP4);
+        return (kNvfp4A4Built || ops::kBuildAdaFp8) && stored_as(binder, reference, QType::NVFP4);
     case ops::LinearPolicy::AllowA8:
-        return kFp8A8Built && stored_as(binder, reference, QType::FP8_E4M3FN_ROW_BF16);
+        return (kFp8A8Built && stored_as(binder, reference, QType::FP8_E4M3FN_ROW_BF16)) ||
+               (ops::kBuildAdaFp8 && stored_as(binder, reference, QType::NVFP4));
     default:
         return false;
     }
 }
 
 } // namespace
-#endif
 
-void apply_rank_policies(Bindings& bindings, std::span<const ops::DeviceTier> rank_tiers) {
-    // A build without 120a narrowed these permissions when it bound the weights.
-    if constexpr (!ops::kBuildBlackwell) {
-        (void)bindings;
-        (void)rank_tiers;
-        return;
-    }
+void apply_rank_policies(Bindings& bindings,
+                         std::span<const ops::DeviceExecutionCapabilities> rank_capabilities,
+                         bool no_fp8_compute) {
     for (PendingWeight& weight : bindings.weights) {
-        if (weight.rank >= rank_tiers.size()) {
-            throw std::logic_error("rank policies: no device tier for pipeline rank " +
+        if (weight.rank >= rank_capabilities.size()) {
+            throw std::logic_error("rank policies: no capabilities for pipeline rank " +
                                    std::to_string(weight.rank));
         }
-        if (rank_tiers[weight.rank] == ops::DeviceTier::Blackwell) { continue; }
+        const auto capabilities = rank_capabilities[weight.rank];
+        const bool blackwell = ops::kBuildBlackwell &&
+                               capabilities.tier == ops::DeviceTier::Blackwell;
+        const bool ada_fp8 = ops::kBuildAdaFp8 && capabilities.ada_fp8;
+        const bool fp8 = stored_as(bindings.binder, weight.reference, QType::FP8_E4M3FN_ROW_BF16);
+        const bool nvfp4 = stored_as(bindings.binder, weight.reference, QType::NVFP4);
         for (WeightUse& use : weight.uses) {
-            if (use.policy == ops::LinearPolicy::AllowA8 ||
-                use.policy == ops::LinearPolicy::AllowA4) {
+            if (!blackwell && (use.policy == ops::LinearPolicy::AllowA8 ||
+                               use.policy == ops::LinearPolicy::AllowA4)) {
+                // Ada admits ordinary E4M3 MMA and the NVFP4-to-E4M3 tile bridge. Its FP4
+                // permission narrows to A8; block-scaled FP4 MMA is Blackwell-only.
+                use.policy = ada_fp8 && (fp8 || nvfp4) ? ops::LinearPolicy::AllowA8
+                                                      : ops::LinearPolicy::A16Only;
+            }
+            // Explicit precision choice applies after device admission, including Blackwell A4.
+            // Groupwise integer weights and their integer-A8 policies retain their own routes.
+            if (no_fp8_compute && (fp8 || nvfp4)) {
                 use.policy = ops::LinearPolicy::A16Only;
             }
         }
@@ -251,10 +259,9 @@ void Bindings::add_uses(PendingWeight& pending, const std::string& name,
             break;
         }
 #if defined(NINFER_SM8X_COMPAT)
-        // sm_86/sm_89 have no FP8 or FP4 tensor cores. A stored permission for A8/A4 activations
-        // is an upper bound, not a requirement, so FP8 and NVFP4 weights run their A16 routes,
-        // which dequantize the stored codes before the matmul. A 120a build on this path keeps the
-        // FP8 A8 and NVFP4 W4A4 units, and there such a weight keeps its permission.
+        // Stored policies are upper bounds. Keep FP8 A8 and NVFP4 bridge permissions
+        // when their units exist; apply_rank_policies narrows them on each actual device.
+        // SM89 has ordinary FP8 MMA, while SM86 needs dequantizing A16 routes.
         if (!keeps_permission(binder, pending.reference, result.policy)) {
             result.policy = ops::LinearPolicy::A16Only;
         }

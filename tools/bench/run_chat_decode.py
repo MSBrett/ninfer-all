@@ -91,13 +91,14 @@ def chat(port, prompt, seed, args):
         "model": "qwen3.8-27b",
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": args.max_tokens,
-        "reasoning_effort": args.reasoning_effort,
         "seed": seed,
     }
-    if args.temperature == 0:
-        body["temperature"] = 0
-    else:
-        body.update({"temperature": args.temperature, "top_p": 0.8, "top_k": 20})
+    if not args.server_defaults:
+        body["reasoning_effort"] = args.reasoning_effort
+        if args.temperature == 0:
+            body["temperature"] = 0
+        else:
+            body.update({"temperature": args.temperature, "top_p": 0.8, "top_k": 20})
     request = urllib.request.Request(
         f"http://127.0.0.1:{port}/v1/chat/completions", data=json.dumps(body).encode(),
         headers={"Content-Type": "application/json"})
@@ -116,7 +117,7 @@ def run_arm(name, server, drop, add, env, prompts, args, rep):
                "--kv-dtype", args.kv_dtype, "--spec", "mtp", "--draft-tokens",
                str(args.draft_tokens), "--lm-head-draft", "--no-prefix-reuse",
                "--request-log-jsonl", str(log)]
-    if args.temperature == 0:
+    if not args.server_defaults and args.temperature == 0:
         command.append("--greedy")
     command = drop_flags(command, drop) + add
 
@@ -173,6 +174,8 @@ def main():
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max-tokens", type=int, default=1024)
     parser.add_argument("--reasoning-effort", default="none")
+    parser.add_argument("--server-defaults", action="store_true",
+                        help="Use server reasoning/sampling defaults; still send max-tokens and seed")
     parser.add_argument("--draft-tokens", type=int, default=3)
     parser.add_argument("--kv-dtype", default="int8")
     parser.add_argument("--max-context", type=int, default=8192)

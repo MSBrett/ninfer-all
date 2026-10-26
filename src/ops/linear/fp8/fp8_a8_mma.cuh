@@ -71,7 +71,7 @@ struct Fp8MmaSchedule {
     static_assert(kStages >= 2 && kStages <= 8);
     static_assert(kMinBlocksPerSm >= 1);
     static_assert(kWarps >= 1 && kThreads <= 1024);
-    // A8 runs only on a card that runs the 120a code: the standard shape set.
+    // Ada and Blackwell A8 use the standard shape set (99 KiB per block).
     static_assert(kSharedBytes <= shape_max_shared_bytes_per_block(false));
     static_assert(kRaster != Fp8MmaRaster::Grouped || kRasterGroupRows > 0);
 };
@@ -110,6 +110,7 @@ template <class Geometry, class Schedule, bool FullTokens, class Epilogue, class
           class RowPolicy = Fp8MmaIdentityRows, bool PairRows = false>
 __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_mma_kernel(
     const std::uint8_t* __restrict__ activation_codes, const float* __restrict__ activation_scales,
+    const float* __restrict__ activation_centers,
     const std::uint8_t* __restrict__ weight_codes, const __nv_bfloat16* __restrict__ weight_scales,
     std::int32_t tokens, Epilogue epilogue, Output output, RowPolicy row_policy = {}) {
     constexpr int TILES_K = Geometry::kInputRows / Schedule::kBlockK;
@@ -144,6 +145,13 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     constexpr int rows_per_block = PairRows ? BN / 2 : BN;
     const int row_begin          = row_tile * rows_per_block;
     const int token_begin        = token_tile * BM;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 890
+    bool centered_token = false;
+    for (int token = token_begin + tid; token < min(token_begin + BM, tokens); token += THREADS)
+        centered_token |= activation_centers && activation_centers[token] != 0.0F;
+    const bool has_center = __syncthreads_or(centered_token);
+    float weight_sums[Schedule::kMmaRows][4] = {};
+#endif
 
     auto stage_activation = [&](int stage, int k_tile) {
         const int k_begin      = k_tile * BK;
@@ -257,6 +265,16 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
                 if (k_step + 1 < Schedule::kMmaK) {
                     load_fragments(k_step + 1, a_fragments[slot ^ 1], b_fragments[slot ^ 1]);
                 }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 890
+                if (has_center) {
+#pragma unroll
+                    for (int row = 0; row < Schedule::kMmaRows; ++row)
+                        mma_fp8_e4m3(weight_sums[row][0], weight_sums[row][1],
+                                     weight_sums[row][2], weight_sums[row][3],
+                                     0x38383838U, 0x38383838U, 0x38383838U, 0x38383838U,
+                                     b_fragments[slot][row][0], b_fragments[slot][row][1]);
+                }
+#endif
 #pragma unroll
                 for (int mma_token = 0; mma_token < Schedule::kMmaTokens; ++mma_token) {
 #pragma unroll
@@ -278,6 +296,16 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
 #pragma unroll
             for (int k_step = 0; k_step < Schedule::kMmaK; ++k_step) {
                 load_fragments(k_step, a_fragments, b_fragments);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 890
+                if (has_center) {
+#pragma unroll
+                    for (int row = 0; row < Schedule::kMmaRows; ++row)
+                        mma_fp8_e4m3(weight_sums[row][0], weight_sums[row][1],
+                                     weight_sums[row][2], weight_sums[row][3],
+                                     0x38383838U, 0x38383838U, 0x38383838U, 0x38383838U,
+                                     b_fragments[row][0], b_fragments[row][1]);
+                }
+#endif
 #pragma unroll
                 for (int mma_token = 0; mma_token < Schedule::kMmaTokens; ++mma_token) {
 #pragma unroll
@@ -323,14 +351,26 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
             const int parent_row1 = row_policy.weight_row(row_begin, local_row0 + 1);
             const std::uint32_t scale_bits = load_vec<std::uint32_t>(weight_scales + parent_row0);
             const float2 weight_scale      = bf16x2_bits_to_float2(scale_bits);
+            const auto activation_value = [&](int element, int token, float scale) {
+                const float scaled = __fmul_rn(accumulators[mma_token][mma_row][element], scale);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 890
+                if (has_center && token < tokens && activation_centers[token] != 0.0F)
+                    return fmaf(weight_sums[mma_row][element & 1], activation_centers[token], scaled);
+#endif
+                return scaled;
+            };
+            const float scaled00 = activation_value(0, token0, activation_scale0);
+            const float scaled01 = activation_value(1, token0, activation_scale0);
+            const float scaled10 = activation_value(2, token1, activation_scale1);
+            const float scaled11 = activation_value(3, token1, activation_scale1);
             float value00 =
-                accumulators[mma_token][mma_row][0] * activation_scale0 * weight_scale.x;
+                scaled00 * weight_scale.x;
             float value01 =
-                accumulators[mma_token][mma_row][1] * activation_scale0 * weight_scale.y;
+                scaled01 * weight_scale.y;
             float value10 =
-                accumulators[mma_token][mma_row][2] * activation_scale1 * weight_scale.x;
+                scaled10 * weight_scale.x;
             float value11 =
-                accumulators[mma_token][mma_row][3] * activation_scale1 * weight_scale.y;
+                scaled11 * weight_scale.y;
             const auto finish = [&](int row, int token, int element, float activation_scale,
                                     float weight_scale, float value) {
                 if constexpr (requires {
@@ -339,8 +379,7 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
                     // Full and tail tiles must contract the same residual update. Activation
                     // scaling stays outside that FMA, so a live-column predicate cannot decide the
                     // MUL+ADD contraction and a column's result cannot depend on its tile.
-                    const float scaled =
-                        __fmul_rn(accumulators[mma_token][mma_row][element], activation_scale);
+                    const float scaled = activation_value(element, token, activation_scale);
                     return epilogue.apply_scaled(row, token, scaled, weight_scale);
                 } else {
                     return epilogue.apply(row, token, value);

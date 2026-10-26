@@ -28,6 +28,8 @@ struct LoadOptions {
     bool mlp_a8_decode = false;
     // Clearing this returns full prefill tiles to their A16 routes; see EngineOptions::prefill_a8.
     bool prefill_a8 = true;
+    // Cap floating compressed-weight activation compute at A16 without changing stored weights.
+    bool no_fp8_compute = false;
     // See EngineOptions::prefill_cublas: hands wide prefill GEMMs to cuBLAS, a further quality
     // trade on top of prefill_a8 and therefore off unless asked for.
     bool prefill_cublas = false;
@@ -129,6 +131,7 @@ struct LoadOptions {
             .expert_residency = options.expert_residency,
             .mlp_a8_decode  = options.mlp_a8_decode,
             .prefill_a8     = options.prefill_a8,
+            .no_fp8_compute = options.no_fp8_compute,
             .prefill_cublas = options.prefill_cublas,
             .prefill_cublas_projections = options.prefill_cublas_projections,
             .gdn_state_fp16 = options.gdn_state_fp16,

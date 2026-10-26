@@ -26,9 +26,9 @@ namespace ninfer::ops {
                                                                  std::int32_t max_tokens);
 
 /**
- * Policy-bearing capacity query. Q4/Q8 use A16 under every policy. NVFP4 uses A16 under
- * A16Only/AllowA8 through T=16; AllowA4 accepts every positive T. Row-scaled FP8 accepts all
- * policies, with A8 permitted by AllowA8/AllowA4.
+ * Policy-bearing capacity query. Q4/Q8 use A16 under every policy. NVFP4 accepts every
+ * positive T; AllowA8/AllowA4 permit its Ada FP8 activation path and AllowA4 may select
+ * native A4 on supporting devices. Row-scaled FP8 also permits A8 under AllowA8/AllowA4.
  * A permissive policy covers whichever qualified route the private resolver selects across the
  * requested interval.
  */
@@ -61,15 +61,16 @@ linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gate_up_rows,
  *   storage rounding belongs to LinearSwiGLU's named activation-compute criterion, not the oracle.
  *   Production routes may fuse or materialize gate/up and may choose their natural accumulator,
  *   staging, and workspace precision; those private choices are not semantic rounding boundaries.
- *   AllowA8/AllowA4 permit FP8 activation quantization; route thresholds are implementation
- * choices.
+ *   AllowA8/AllowA4 permit FP8 activation quantization for FP8 and NVFP4 weights. NVFP4
+ *   retains exact E2M1 codes and applies each G16 scale to its FP32 partial product; gate and up
+ *   keep their independent global divisors. Route thresholds are implementation choices.
  *
  * Effects:
  *   Writes the full output; x/weight and output must not alias.
  *
  * Workspace:
  *   Caller-owned transient storage reported by linear_swiglu_workspace_capacity_bytes(),
- *   scoped to the call. Q8, NVFP4 A16, and row-scaled FP8 A16 require zero bytes; A4/A8 routes use
+ *   scoped to the call. Q8, NVFP4 A16, and row-scaled FP8 A16 require zero bytes. A4/A8 routes use
  *   caller-owned activation storage and may use private projection storage. There is no persistent
  *   state side effect.
  */
@@ -77,9 +78,8 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
                    WorkspaceArena& ws, cudaStream_t stream);
 
 /**
- * A16-only convenience form. Q4/Q8 and row-scaled FP8 retain their complete positive-T domain.
- * NVFP4 is admitted only through T=16; larger NVFP4 extents require the policy-bearing AllowA4
- * form.
+ * A16-only convenience form. Every registered format retains its complete positive-T domain.
+ * Size the caller-owned workspace with the matching A16 capacity query.
  */
 void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, WorkspaceArena& ws,
                    cudaStream_t stream);

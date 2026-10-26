@@ -70,7 +70,7 @@ The built-in recipes are ordinary Python functions in
 | `qwen3_6_35b_a3b_nvfp4` | Imported NVFP4 routed and shared experts, Q8 projection weights, Q8/Q6 vocabulary weights | `quantized` |
 | `qwen3_6_27b_nvfp4` | Imported NVFP4, selected BF16 projections, Q8 vocabulary weights | `quantized` |
 | `qwen3_8_27b_nvfp4` | Imported NVFP4/FP8, FP8 embedding generated from BF16 | `quantized` |
-| `qwen3_8_27b_nvfp4_nvidia` | nvidia/Qwen3.8-27B-NVFP4 (ModelOpt AutoQuant): imported NVFP4 MLP projections and per-row FP8 attention and GDN projections; FP8 embedding, and the NVFP4 output head re-quantized to FP8 | `quantized` |
+| `qwen3_8_27b_nvfp4_nvidia` | nvidia/Qwen3.8-27B-NVFP4 (ModelOpt AutoQuant): imported NVFP4 MLP projections and output head, per-row FP8 attention and GDN projections, and FP8 embedding generated from BF16 | `quantized` |
 | `qwen3_8_27b_nvfp4_orcarouter` | orcarouter/Qwen3.8-27B-Uncensored-NVFP4 (GPTQ compressed-tensors): imported NVFP4 MLP projections in layers 0-55, per-row FP8 everywhere else; FP8 embedding and output head from BF16 | `quantized` |
 | `bonsai2_27b_ternary` | Imported ternary T2 text tower with Hadamard-rotated Uses, Q8 primal embedding | `ternary` (GGUF) |
 | `qwen3_8_27b_gguf` | Every text, embedding, head and MTP tensor in its GGUF block format, byte for byte | `gguf` (GGUF), `vision` (mmproj GGUF) |
@@ -396,7 +396,18 @@ channel weights. The search runs on `--device`; a CUDA device is much faster tha
 `fp8_row_maxabs` first rounds input values to BF16, then produces E4M3FN codes and one BF16
 multiplier per row.
 `import_encoded` preserves compatible code and scale words, including NVFP4's matrix weight divisor.
-It does not dequantize and requantize them.
+It does not dequantize and requantize them. The NVIDIA Qwen3.8 recipe retains its NVFP4
+output head, while the Unsloth recipe retains its FP8 head and the final eight FP8 MLP
+layers. ModelOpt multiplicative global scales become FP32 reciprocal divisors; separate
+gate/up source divisors remain separate. Per-tensor FP8 scales are replicated by row and
+rounded to the stored BF16 scale format.
+
+With `--proposal`, a shortlist derived from an imported head retains that head's encoded
+rows and format (NVFP4 for NVIDIA, FP8 for Unsloth), together with each draft input's
+activation permission and calibration. The optional MTP projections still use native Q8,
+including the fused Q8 MLP path. These stored weight choices do not imply a particular
+compute route or KV-cache capacity; runtime routes and available memory depend on the GPU
+and selected options.
 
 The exact numeric and packing rules are in [numeric formats](maintainer/tensor-formats.md) and
 [storage layouts](maintainer/storage-layouts.md). Source format names alone do not establish
@@ -453,8 +464,12 @@ For explicit organization, `recipe.group([names...])` concatenates compatible se
 given order, `recipe.separate(names)` disables automatic grouping for those parameters, and
 `recipe.share(parameter, target)` binds equal-shaped parameters to the same physical data.
 Explicit groups must be disjoint and use unsplit selections with matching format, layout, method
-and method parameters. NVFP4 parents also require a common weight divisor. Automatic grouping is
-limited to built-in methods; custom methods can request explicit groups.
+and method parameters. NVFP4 explicit groups retain separate source weight divisors when
+equal row groups need them. The NVIDIA and Unsloth Qwen3.8 recipes explicitly group each NVFP4
+gate/up pair. They permit A4 only when both weight-divisor words and both activation-divisor
+words match; otherwise the pair permits A8 (and A16), retaining each source calibration.
+Automatic grouping requires a common NVFP4 weight divisor and is limited to built-in methods;
+custom methods can request explicit groups.
 
 Grouping chooses storage. Model execution code chooses the supported fused implementation. The
 loader uploads the stored representation, without repacking an inconvenient arrangement.

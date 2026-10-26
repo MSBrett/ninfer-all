@@ -2,7 +2,8 @@
 """NInfer monitoring sidecar.
 
 Polls the server's GET /stats, tails its JSONL request log (--request-log-jsonl), and samples
-nvidia-smi, /proc and an optional temperature sensor command, then serves:
+nvidia-smi, native Windows APIs or Linux /proc, and an optional temperature sensor command,
+then serves:
   - a self-contained HTML dashboard at /
   - a JSON snapshot at /api/samples
   - a liveness probe at /healthz
@@ -15,6 +16,7 @@ rotation by rename or truncation.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import os
 import re
@@ -34,6 +36,48 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 POLL_TIMEOUT_S = 5
 STALE_AFTER_MS = 60_000
 SENSOR_TIMEOUT_S = 15
+
+
+class MemoryStatusEx(ctypes.Structure):
+    _fields_ = [("dwLength", ctypes.c_uint32), ("dwMemoryLoad", ctypes.c_uint32)] + [
+        (name, ctypes.c_uint64) for name in (
+            "ullTotalPhys", "ullAvailPhys", "ullTotalPageFile", "ullAvailPageFile",
+            "ullTotalVirtual", "ullAvailVirtual", "ullAvailExtendedVirtual")
+    ]
+
+
+class WindowsSystem:
+    """Stdlib bindings for host CPU time and physical RAM, without per-tick subprocesses."""
+
+    def __init__(self) -> None:
+        from ctypes import wintypes
+
+        self.filetime = wintypes.FILETIME
+        self.kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        self.kernel32.GetSystemTimes.argtypes = [ctypes.POINTER(self.filetime)] * 3
+        self.kernel32.GetSystemTimes.restype = wintypes.BOOL
+        self.kernel32.GlobalMemoryStatusEx.argtypes = [ctypes.POINTER(MemoryStatusEx)]
+        self.kernel32.GlobalMemoryStatusEx.restype = wintypes.BOOL
+
+    def cpu_times(self) -> tuple[int, int]:
+        idle, kernel, user = self.filetime(), self.filetime(), self.filetime()
+        if not self.kernel32.GetSystemTimes(
+                ctypes.byref(idle), ctypes.byref(kernel), ctypes.byref(user)):
+            raise ctypes.WinError(ctypes.get_last_error())
+
+        def ticks(value) -> int:
+            return (value.dwHighDateTime << 32) | value.dwLowDateTime
+
+        # Windows kernel time already includes idle time.
+        return ticks(idle), ticks(kernel) + ticks(user)
+
+    def ram(self) -> dict:
+        status = MemoryStatusEx()
+        status.dwLength = ctypes.sizeof(status)
+        if not self.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return {"used_mb": (status.ullTotalPhys - status.ullAvailPhys) / 1048576.0,
+                "total_mb": status.ullTotalPhys / 1048576.0}
 
 
 class Config:
@@ -124,6 +168,7 @@ def flatten_stats(stats: dict, memory: dict) -> dict:
     selections = cache.get("selections", {})
     hybrid = cache.get("hybrid", {})
     hybrid_host_capacity = hybrid.get("host_capacity_bytes", 0)
+    use_hybrid = memory.get("context_cache_mode") == "hybrid" or hybrid_host_capacity > 0
 
     def transfers(block: str, unit: str) -> dict:
         out = {}
@@ -144,11 +189,13 @@ def flatten_stats(stats: dict, memory: dict) -> dict:
         "counters": stats.get("counters", {}),
         "memory": {
             "kv_capacity_page_groups": capacity.get("kv_capacity_pages", 0),
-            "host_cache_kind": "hybrid" if hybrid_host_capacity else "legacy",
-            "host_cache_capacity_bytes": hybrid_host_capacity or capacity.get("host_kv_bytes", 0),
-            "host_cache_occupied_bytes": (hybrid.get("host_used_bytes", 0)
-                                          if hybrid_host_capacity
-                                          else occupancy.get("host_kv_bytes", 0)),
+            "host_cache_kind": "hybrid" if use_hybrid else "legacy",
+            "host_cache_capacity_bytes": (
+                hybrid_host_capacity or memory.get("host_cache_budget_bytes", 0)
+                if use_hybrid else capacity.get("host_kv_bytes", 0)),
+            "host_cache_occupied_bytes": (
+                hybrid.get("host_used_bytes", occupancy.get("host_kv_bytes", 0))
+                if use_hybrid else occupancy.get("host_kv_bytes", 0)),
             "host_state_capacity_slots": capacity.get("host_state_slots", 0),
             "host_state_occupied_slots": occupancy.get("host_state_slots", 0),
             "kv_payload_bytes": memory.get("kv_payload_bytes"),
@@ -187,6 +234,7 @@ class Monitor:
         self.last_rates: dict | None = None
         self.last_cpu_idle = None
         self.last_cpu_total = None
+        self._windows = WindowsSystem() if os.name == "nt" else None
         self.jsonl_tail = Tail(cfg.jsonl) if cfg.jsonl else None
         self._kv_totals: dict[str, int] = {}
         # The speculative backend in use (last seen in a request log record), e.g. "dflash2".
@@ -216,7 +264,10 @@ class Monitor:
     def _server_start(self, rec: dict) -> None:
         self.server_info["instance_id"] = rec.get("server_instance_id")
         self.server_info["model"] = rec.get("server", {}).get("public_model_id")
-        self.server_info["memory"] = rec.get("memory", {})
+        self.server_info["memory"] = {
+            **rec.get("memory", {}),
+            "context_cache_mode": rec.get("engine", {}).get("context_cache", {}).get("mode"),
+        }
         self.spec_backend = rec.get("engine", {}).get("speculative_backend")
 
     # -- request log --------------------------------------------------------
@@ -356,25 +407,31 @@ class Monitor:
 
     def read_cpu(self) -> float | None:
         try:
-            with open("/proc/stat") as f:
-                first = f.readline().split()
-            vals = [int(x) for x in first[1:]]
-            idle = vals[3] + (vals[4] if len(vals) > 4 else 0)  # idle + iowait
-            total = sum(vals)
-            pct = 0.0
+            if self._windows is not None:
+                idle, total = self._windows.cpu_times()
+            else:
+                with open("/proc/stat") as f:
+                    first = f.readline().split()
+                vals = [int(x) for x in first[1:]]
+                idle = vals[3] + (vals[4] if len(vals) > 4 else 0)  # idle + iowait
+                # guest/guest_nice are already included in user/nice.
+                total = sum(vals[:8])
+            pct = None
             if self.last_cpu_total is not None and self.last_cpu_idle is not None:
                 dt = total - self.last_cpu_total
                 di = idle - self.last_cpu_idle
-                if dt > 0:
+                if dt > 0 and 0 <= di <= dt:
                     pct = 100.0 * (1.0 - di / dt)
             self.last_cpu_idle = idle
             self.last_cpu_total = total
-            return max(0.0, min(100.0, pct))
+            return pct
         except (OSError, ValueError, IndexError):
             return None
 
     def read_ram(self) -> dict | None:
         try:
+            if self._windows is not None:
+                return self._windows.ram()
             info: dict[str, int] = {}
             with open("/proc/meminfo") as f:
                 for line in f:
@@ -895,7 +952,9 @@ function render(d){
       gpu.mem_used_mb?(gpu.mem_used_mb/1024).toFixed(1)+' / '+(gpu.mem_total_mb/1024).toFixed(0)+' GB':''),
     tile('GPU pwr',gpu.power_w!=null?gpu.power_w.toFixed(0)+' W':'–','of '+(gpu.power_limit_w!=null?gpu.power_limit_w.toFixed(0):'?')+' W'),
     ...(sensor?[tile(sensor.label,hpwr!=null?hpwr.toFixed(1)+'°C':'–',hpwrSub,hpwrColor)]:[]),
-    tile('CPU',latest.cpu_pct!=null?latest.cpu_pct.toFixed(0)+'%':'–',ram.used_mb?(ram.used_mb/1024).toFixed(1)+' / '+(ram.total_mb/1024).toFixed(0)+' GB':''),
+    tile('CPU',latest.cpu_pct!=null?latest.cpu_pct.toFixed(0)+'%':'–','host utilization'),
+    tile('RAM',ram.total_mb?((ram.used_mb/ram.total_mb)*100).toFixed(0)+'%':'–',
+      ram.total_mb?(ram.used_mb/1024).toFixed(1)+' / '+(ram.total_mb/1024).toFixed(1)+' GiB used':'physical memory'),
     tile('Admitted',(latest.stats?.http?.in_flight!=null?latest.stats.http.in_flight:'–')+' / '+(latest.stats?.http?.max_in_flight!=null?latest.stats.http.max_in_flight:'–'),'now / peak'),
   ];
   $('tiles').innerHTML=tiles.join('');

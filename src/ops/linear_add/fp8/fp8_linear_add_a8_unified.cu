@@ -50,6 +50,10 @@ void launch_problem(const Tensor& x, const Weight& weight, Tensor& residual,
         else
             launch_fp8_a8_mma<S>(operands, output, epilogue, stream);
     };
+    if (current_device_ada_fp8()) {
+        if (x.ne[1] <= 32) return launch.template operator()<Fp8A8T32R64K128>();
+        return launch.template operator()<Fp8A8T64R128K128>();
+    }
     if constexpr (K == 6144) {
         if (x.ne[1] <= 64) return launch.template operator()<K6144Tma32x64>();
         if (x.ne[1] <= 128) return launch.template operator()<Fp8A8T64R64K128>();
@@ -71,6 +75,7 @@ void launch_problem(const Tensor& x, const Weight& weight, Tensor& residual,
 } // namespace
 
 std::size_t fp8_linear_add_partial_capacity_bytes(std::int32_t k, std::int32_t max_tokens) {
+    if (current_device_ada_fp8()) return 0;
     if (k == 6144) {
         if (max_tokens > 768) return K6144Bulk::kPartialBytes;
         return max_tokens > 192 ? K6144MidBulk::kPartialBytes : 0;

@@ -41,6 +41,36 @@ Two things it refuses rather than lets you get wrong:
 line and needs changing for `ninfer_bench`, which prints CSV. A run where any sample produced no
 number exits 1, because a comparison with a hole in it is not a comparison.
 
+## Ada activation candidates in native Op benchmarks
+
+`ninfer_linear_bench`, `ninfer_nvfp4_linear_swiglu_bench` and
+`ninfer_nvfp4_linear_add_bench` accept `--activation-route auto|a16|a8` separately from
+`--policy`. Policy is the permitted arithmetic; `auto` measures production dispatch and may
+select A16 under an A8-permitting policy. An explicit route measures that candidate, subject to
+the loaded native SM89 implementation, supported shape and activation permission. For example:
+
+```bash
+rtk build/bench/ninfer_benches ninfer_nvfp4_linear_swiglu_bench --policy a8 --activation-route a16 --t-sweep 1,4,17,65,1024 --csv-out a16.csv
+rtk build/bench/ninfer_benches ninfer_nvfp4_linear_swiglu_bench --policy a8 --activation-route a8 --t-sweep 1,4,17,65,1024 --csv-out a8.csv
+```
+
+Generic Linear overrides require an explicit registered NVFP4 shape, or FP8 `[5120,6144]`;
+that FP8 A8 candidate requires T>=17. Forcing `a8` requires an A8-permitting policy, such as
+`--policy a8`. It does not override `A16Only`. Auto currently keeps dense NVFP4 on A16 and
+switches FP8 `[5120,6144]` from A16 to A8 at T=33.
+
+The `activation_route` CSV column and console header record the **requested** route. In
+particular, `auto` is not proof that A8 executed, and `policy=A8` is not a dispatch result.
+Keep requested route, shape, width and policy separate when pairing repetitions; do not merge
+Auto and forced-A8 observations. These are complete public-Op cold-cache measurements on
+benchmark fixtures, not model-inference throughput or source-checkpoint quality measurements.
+Retain failed/unsupported calls and both repetitions. The [initial comparison](../../profiles/bench/ada-fp8-nvfp4-cuda134/micro/initial/)
+and [FP8 crossover probe](../../profiles/bench/ada-fp8-nvfp4-cuda134/micro/fp8_crossover/)
+remain the evidence for their original implementations. Initial wide fused A8 gains used a slow
+A16 fallback; they must not stand in for a comparison with the replacement optimized A16 routes,
+whose combined qualification has unresolved failures and whose final measurements are pending.
+Timing CSVs alone do not establish numerical correctness.
+
 ## External Serve TTFT
 
 [`ttft/README.md`](ttft/README.md) defines the black-box latency benchmark. The measurement runner
@@ -246,6 +276,12 @@ Arms are interleaved, in order on even passes and reversed on odd, because betwe
 on one RTX 3090 is 3-5%; always A/B two binaries inside one sitting rather than across sessions.
 Each arm may drop or add server flags, so one binary can be compared against itself under different
 options.
+
+Use `--server-defaults` to inherit the server's reasoning and sampling settings instead of the
+runner's thinking-off/greedy defaults. It still sends the requested output cap (`--max-tokens`)
+and per-prompt seed; `--temperature` and `--reasoning-effort` are ignored in this mode. Configure
+the server defaults with the arm's `add=` flags, and retain the startup/request logs when comparing
+with runs that used different generation settings.
 
 ```bash
 python3 tools/bench/run_chat_decode.py \

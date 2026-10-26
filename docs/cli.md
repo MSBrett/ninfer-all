@@ -298,6 +298,7 @@ The table lists executable defaults. The examples above select INT8 KV and MTP3.
 | `--mtp-experts-q4` | Qwen3.6-35B-A3B: store the MTP layer's routed experts in the text layers' formats | off |
 | `--gdn-state-fp16` | keep the GDN recurrent state in FP16 | FP32 |
 | `--mlp-a8-decode` | integer-activation MLP gate_up at decode and verify widths | off |
+| `--no-fp8-compute` | cap FP8/NVFP4 weight projections at A16 activation compute while retaining compressed weights; independent of integer A8 controls | off |
 | `--no-prefill-a8` | return full prefill tiles to their A16 routes, which is how the integer routes are measured on a whole request | integer routes |
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
 | `--vision-residency resident\|overlay\|cpu` | `overlay` keeps the Vision tower host-pinned and borrows device memory per image from the evictable text weight tail (no resident Vision cost; needs CUDA VMM); for Gemma 4 the tower's blocks stay pinned and stream through a two-block device window. `--vision-offload on\|off` is accepted as an alias for `overlay\|resident`. `cpu` encodes on CPU threads from host FP32 weights, with no device Vision memory and `--vision-max-merged` capped at 256 unless given. Qwen3.8-Flash-Next keeps its tower resident | `resident` |
@@ -374,9 +375,14 @@ window. What fits depends on the card, the artifact, the media workload, the out
 KV format. The artifact describes its model configuration and weight representations;
 `--kv-dtype` independently selects runtime KV storage, BF16 by default. All nine formats — `bf16`,
 `int8`, `fp8`, `rk8v4`, `rk4v4`, `rk4v4-e8`, `rk2v4-e8`, `k8v4`, `nvfp4` — are accepted on every
-build target: the Blackwell-only `mma.sync...kind::f8f6f4` restriction applies to FP8/NVFP4
-*weights and activations*, not to KV storage. Measured size, decode speed and perplexity of seven of
-them on an RTX 3090 are in [performance](performance.md#kv-formats-on-qwen38-27b) and the
+build target. Ada supports ordinary FP8 Tensor Core MMA, but permission to use FP8 activations
+lets each projection choose its route; it does not force every Op onto A8. The current dense
+Qwen3.8-27B NVFP4 Auto routes select A16 while retaining packed weights, decoded within the
+kernel without a persistent expanded copy. The explicit NVFP4 A8 candidate converts packed
+E2M1 codes to exact FP8 tile operands. Native block-scaled FP8/FP4 instructions such as
+`mma.sync...kind::f8f6f4` require Blackwell; KV storage formats are independent of these weight
+compute routes. Measured size, decode speed and perplexity of seven KV formats on an RTX 3090
+are in [performance](performance.md#kv-formats-on-qwen38-27b) and the
 [configuration calculator](config-calculator.html).
 
 `rk8v4` is the best all-round choice: rotated INT8 keys with a packed signed int4 value plane,

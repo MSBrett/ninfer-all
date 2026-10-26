@@ -61,6 +61,13 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     constexpr int rows_per_block = PairRows ? BN / 2 : BN;
     const int row_begin          = row_tile * rows_per_block;
     const int token_begin        = token_offset + token_tile * BM;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 890
+    bool centered_token = false;
+    for (int token = token_begin + tid; token < min(token_begin + BM, tokens); token += THREADS)
+        centered_token |= operands.x_centers && operands.x_centers[token] != 0.0F;
+    const bool has_center = __syncthreads_or(centered_token);
+    float weight_sums[Schedule::kMmaRows][4] = {};
+#endif
 
     auto stage_inputs = [&](int stage, int k_tile) {
         const int k_begin      = k_tile * BK;
@@ -120,7 +127,11 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
         __syncthreads();
 
         fp8_mma_compute_stage<Schedule>(activation_shared + stage * BM * BK,
-                                        weight_shared + stage * BN * BK, accumulators, warp, lane);
+                                        weight_shared + stage * BN * BK, accumulators, warp, lane
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 890
+                                        , has_center ? weight_sums : nullptr
+#endif
+                                        );
 
         __syncthreads();
         const int next_k_tile = k_tile + S;
@@ -133,7 +144,11 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
 
     fp8_finish_mma_tile<Schedule, FullTokens>(
         output, epilogue, row_policy, shared_raw, accumulators, activation_scales, weight_scales,
-        row_begin, token_begin, operands.rows, tokens, warp, lane);
+        row_begin, token_begin, operands.rows, tokens, warp, lane
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 890
+        , operands.x_centers, has_center ? weight_sums : nullptr
+#endif
+        );
 }
 
 } // namespace ninfer::ops::detail::unified

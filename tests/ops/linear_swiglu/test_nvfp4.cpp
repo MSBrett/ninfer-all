@@ -1,4 +1,6 @@
 #include "core/weight.h"
+#include "ops/common/device_tier.h"
+#include "ops/common/device_route.h"
 #include "ops/linear_swiglu/linear_swiglu_test_common.h"
 
 #include "ninfer/ops/linear_swiglu.h"
@@ -70,7 +72,9 @@ int check_negative_gate() {
     const double ideal = gate / (1.0 + std::exp(-gate)) * up;
     const auto bytes   = ops::linear_swiglu_workspace_capacity_bytes(
         weight.qtype, rows, k, ops::LinearPolicy::AllowA4, 1, max_tokens);
-    WorkspaceArena workspace(bytes);
+    // Zero-scratch A16 routes still need a nonempty arena object, matching
+    // the shared test harness convention; the Op consumes none of its bytes.
+    WorkspaceArena workspace(std::max<std::size_t>(bytes,256));
     int failures = 0;
     for (int tokens : {1, 64, 129, 256, 257}) {
         const std::string label = "NVFP4 SwiGLU negative gate T=" + std::to_string(tokens);
@@ -102,7 +106,8 @@ int main() {
         return 77;
     }
     try {
-        constexpr std::array<std::int32_t, 4> kA16Cases{1, 4, 8, 16};
+        constexpr std::array<std::int32_t, 15> kA16Cases{
+            1,4,8,16,17,32,33,64,65,96,97,128,129,257,1025};
         // 511 and 513 straddle the ragged floor: the first still reaches the composition, the
         // second is the narrowest ragged width the fused route admits and leaves one real token
         // in a third M tile. 767 leaves that tile all but full, and 1025 leaves one after four
@@ -114,10 +119,24 @@ int main() {
         int failures = check_negative_gate();
         failures += run_profile("LinearSwiGLU NVFP4_A16",
                                 {QType::NVFP4, 34816, 5120, 17408, 1801U, ActivationCompute::A16},
-                                kA16Cases);
+                                kA16Cases, std::array<std::int32_t,3>{17,65,1025});
         failures += run_profile("LinearSwiGLU NVFP4_A4",
                                 {QType::NVFP4, 34816, 5120, 17408, 1803U, ActivationCompute::A4},
                                 kA4Cases, std::array<std::int32_t, 4>{65, 97, 128, 129});
+        if (ops::current_device_ada_fp8()) {
+            const ops::DeviceRouteForce candidate("nvfp4_linear_swiglu/34816x5120","a8");
+            constexpr std::array<std::int32_t, 12> a8_cases{1, 3, 8, 16, 17, 32, 33, 64, 65, 129, 257, 1025};
+            constexpr std::array<std::int32_t, 4> a8_graphs{1, 17, 65, 1025};
+            failures += run_profile("LinearSwiGLU NVFP4_A8",
+                {QType::NVFP4, 34816, 5120, 17408, 1811U, ActivationCompute::A8, false, true},
+                a8_cases, a8_graphs);
+            failures += run_profile("LinearSwiGLU NVFP4_A8 split divisors",
+                {QType::NVFP4, 34816, 5120, 17408, 1813U, ActivationCompute::A8, true, true},
+                a8_cases, a8_graphs);
+            failures += run_profile("LinearSwiGLU NVFP4_A16 split divisors",
+                {QType::NVFP4, 34816, 5120, 17408, 1813U, ActivationCompute::A16, true, true},
+                a8_cases, a8_graphs);
+        }
         std::cout << (failures == 0 ? "OK" : "FAIL") << " LinearSwiGLU NVFP4 correctness\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

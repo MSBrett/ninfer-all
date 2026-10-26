@@ -4,6 +4,8 @@
 #include "core/device.h"
 #include "ninfer_bench_common.h"
 #include "quantized_weight.cuh"
+#include "ops/common/device_route.h"
+#include "ops/common/device_tier.h"
 
 #include <cuda_profiler_api.h>
 #include <cuda_runtime.h>
@@ -15,6 +17,7 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -31,6 +34,7 @@ struct Options {
     std::int32_t n           = 0;
     std::int32_t k           = 0;
     ops::LinearPolicy policy = ops::LinearPolicy::A16Only;
+    std::string activation_route = "auto";
     std::vector<std::int32_t> t_sweep{1, 4, 8, 16, 17, 128, 512, 1024};
     int warmup   = 5;
     int repeat   = 30;
@@ -80,11 +84,18 @@ Options parse_options(int argc, char** argv) {
             const std::string_view value = next("--policy");
             if (value == "a16") {
                 options.policy = ops::LinearPolicy::A16Only;
+            } else if (value == "a8") {
+                options.policy = ops::LinearPolicy::AllowA8;
             } else if (value == "a4") {
                 options.policy = ops::LinearPolicy::AllowA4;
             } else {
-                throw std::invalid_argument("--policy must be a16 or a4");
+                throw std::invalid_argument("--policy must be a16, a8 or a4");
             }
+        } else if (argument == "--activation-route") {
+            options.activation_route = next("--activation-route");
+            if (options.activation_route != "auto" && options.activation_route != "a16" &&
+                options.activation_route != "a8")
+                throw std::invalid_argument("--activation-route must be auto, a16 or a8");
         } else if (argument == "--t-sweep") {
             options.t_sweep = parse_t_sweep(next("--t-sweep"));
         } else if (argument == "--warmup") {
@@ -97,7 +108,8 @@ Options parse_options(int argc, char** argv) {
             options.csv_out = next("--csv-out");
         } else if (argument == "--help" || argument == "-h") {
             std::printf(
-                "Usage: %s --n 5120 --k 6144|17408 [--policy a16|a4] "
+                "Usage: %s --n 5120 --k 6144|17408 [--policy a16|a8|a4] "
+                "[--activation-route auto|a16|a8] "
                 "[--t-sweep 1,4,...] [--warmup N] [--repeat N] [--profile] [--csv-out PATH]\n",
                 argv[0]);
             std::exit(0);
@@ -118,7 +130,8 @@ Options parse_options(int argc, char** argv) {
 }
 
 const char* policy_name(ops::LinearPolicy policy) {
-    return policy == ops::LinearPolicy::AllowA4 ? "A4" : "A16";
+    return policy == ops::LinearPolicy::AllowA4 ? "A4" :
+           policy == ops::LinearPolicy::AllowA8 ? "A8" : "A16";
 }
 
 void write_csv(const Options& options, const std::vector<Result>& results,
@@ -128,10 +141,10 @@ void write_csv(const Options& options, const std::vector<Result>& results,
     if (!path.parent_path().empty()) { std::filesystem::create_directories(path.parent_path()); }
     std::ofstream out(path);
     if (!out) { throw std::runtime_error("failed to open CSV: " + options.csv_out); }
-    out << "op,weight_type,policy,N,K,T,weight_bytes,median_us,min_us,p95_us,effective_gbs,"
+    out << "op,weight_type,policy,activation_route,N,K,T,weight_bytes,median_us,min_us,p95_us,effective_gbs,"
            "useful_tflops,warmup,repeat,flush_bytes\n";
     for (const Result& result : results) {
-        out << "linear_add,NVFP4," << policy_name(options.policy) << ',' << options.n << ','
+        out << "linear_add,NVFP4," << policy_name(options.policy) << ',' << options.activation_route << ',' << options.n << ','
             << options.k << ',' << result.tokens << ',' << weight_bytes << ','
             << result.timing.median_us << ',' << result.timing.min_us << ',' << result.timing.p95_us
             << ',' << result.effective_gbs << ',' << result.useful_tflops << ',' << options.warmup
@@ -150,6 +163,16 @@ int main(int argc, char** argv) {
             *std::min_element(options.t_sweep.begin(), options.t_sweep.end());
         cudaStream_t stream = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        std::optional<ops::DeviceRouteForce> route;
+        if (options.activation_route != "auto") {
+            if (!ops::current_device_ada_fp8())
+                throw std::invalid_argument("NVFP4 activation-route override requires loaded Ada FP8 code");
+            if (options.activation_route == "a8" && !ops::allows_a8(options.policy))
+                throw std::invalid_argument("a8 activation route requires a8 permission");
+            route.emplace("nvfp4_linear_add/"+std::to_string(options.n)+"x"+std::to_string(options.k),
+                          options.activation_route);
+        }
+        std::printf("activation_route=%s (policy is permission)\n",options.activation_route.c_str());
         DeviceBuffer flush(kFlushBytes);
         DeviceBuffer input    = bench::make_bf16(static_cast<std::size_t>(options.k) * max_t);
         DeviceBuffer residual = bench::make_bf16(static_cast<std::size_t>(options.n) * max_t);

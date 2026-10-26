@@ -112,7 +112,7 @@ survives a second interleaved measurement, and its output matches the compiled r
 | `q6_head/248320x5120` | the Q6 vocabulary head's per-row GEMV (`gemv`, widths 1 and 2) or small-T MMA (`small_t`, widths up to 32) | widths 1 to 32 |
 | `q8_ksplit/<rows>x<k>` | the four-K-warp form (`kw4`: at most 128 registers a thread, four CTAs an SM) of the 8-column tile of the Q8 G32 K-split contraction, which MTP heads, DFlash2 drafters and Q8 heads run, instead of the route's own schedule | the eleven contraction shapes of those layers, widths 1 to 8 |
 | `unified/q4_q5_attn_input`, `unified/q4_q5_gdn_input`, `unified/q4_linear_swiglu`, `unified/q4_linear_add`, `unified/q5_linear_add/5120x<k>` | upstream's routes for the fused groupwise projections over the unified Linear templates (`unified`) instead of this line's own | the model shapes, widths 1 to 64 (the small-T launches only where those are all the switch covers) |
-| `unified/q4_linear_topk`, `unified/q8_*`, `unified/fp8_*`, `unified/nvfp4_*`, `unified/bf16_*`, `unified/context_kv_materialize` | the same switch for the Q4 top-k head, the Q8 fused projections (attention and GDN inputs, LinearAdd, pair, SwiGLU, top-k, grouped convolution, context-KV materialization), the FP8 and NVFP4 fused projections (attention and GDN inputs with their conv forms, LinearAdd, SwiGLU, the FP8 top-k), and the BF16 attention input and LinearAdd | not calibrated: the built-in RTX 3090, 4090 and 5090 profiles carry the widths where each Op's benchmark ran faster on the unified routes over two rounds per table (at least 3 % over the geometric mean, no case more than 3 % slower), and keep them under a calibrated file entry; elsewhere a hand-edited profile entry or `NINFER_LINEAR_ROUTES` sets them. Those benchmarks ran to width 1024: a wider FP8 call with A16 activations (every FP8 call of a build other than `120a`, which alone carries the FP8 A8 routes) takes the unified LinearAdd and SwiGLU, and the unified pure Linear, where no profile band reaches its width, because the legacy A16 routes run it in 4-token passes that each read the whole weight |
+| `unified/q4_linear_topk`, `unified/q8_*`, `unified/fp8_*`, `unified/nvfp4_*`, `unified/bf16_*`, `unified/context_kv_materialize` | the same switch for the Q4 top-k head, the Q8 fused projections (attention and GDN inputs, LinearAdd, pair, SwiGLU, top-k, grouped convolution, context-KV materialization), the FP8 and NVFP4 fused projections (attention and GDN inputs with their conv forms, LinearAdd, SwiGLU, the FP8 top-k), and the BF16 attention input and LinearAdd | not calibrated: the built-in RTX 3090, 4090 and 5090 profiles carry the widths where each Op's benchmark ran faster on the unified routes over two rounds per table (at least 3 % over the geometric mean, no case more than 3 % slower), and keep them under a calibrated file entry; elsewhere a hand-edited profile entry or `NINFER_LINEAR_ROUTES` sets them. Those benchmarks ran to width 1024: a wider FP8 call with A16 activations (including builds without the SM89 or `120a` FP8 A8 units) takes the unified LinearAdd and SwiGLU, and the unified pure Linear, where no profile band reaches its width, because the legacy A16 routes run it in 4-token passes that each read the whole weight |
 | `w4_cublas/<op>`, `w4_cublas/<op>/a8` | with `--prefill-cublas`, whether a prompt call of each projection (`q4_linear_swiglu`, `linear_add/5120x17408`, `linear_add/5120x6144`, `q4_q5_gdn_input`, `q4_q5_attn_input`) takes the cuBLAS route (`on`, `off`): the plain key at widths the integer A8 mainloop cannot take, `/a8` at the multiples of its 128-column tile. Where no band reaches a width, calls of 512 columns and more take the route; no band sends a call of 128 columns or fewer (a decode or verify round) to it | widths 136 to 1,500, and 256 to 2,048 under `/a8` |
 | `gdn_two_stage/h<value heads>` | the two-stage GDN prefill (fused Q/K normalization and control preparation, then one FP32-state recurrence that also writes the output) instead of the WY/state-passing/output pipeline | prompts of 16 to 8192 tokens, 48 and 32 value heads |
 
@@ -120,6 +120,35 @@ survives a second interleaved measurement, and its output matches the compiled r
 `NINFER_GDN_TWO_STAGE` (`0` or `1`) override the profile for their route; `NINFER_PROMPT_SPLITS=0`
 turns the prompt key splits off and `N` forces N splits wherever a call may split; `NINFER_LINEAR_ROUTES`
 (`legacy` or `unified`) takes one table for every Linear shape and every `unified/*` switch. `--fast-prefill-kernel` turns the fast prompt kernel on regardless.
+
+## Dense Qwen3.8-27B activation routes on Ada
+
+These finite route keys accept `a16` or `a8` in device-profile width bands, or through a scoped
+`ops::DeviceRouteForce` during qualification and measurement. They are explicit overrides, not
+additional families measured by automatic calibration.
+
+| route key | compiled Ada choice without an override |
+|---|---|
+| `fp8_linear/5120x6144` | A16 through T=32, A8 from T=33 when the Use permits it |
+| `nvfp4_linear/<N>x<K>` | A16; the finite shapes are `14336x5120`, `16384x5120`, `34816x5120`, `131072x5120`, `248320x5120`, `5120x6144` and `5120x17408` |
+| `nvfp4_linear_swiglu/34816x5120` | A16 |
+| `nvfp4_linear_add/5120x6144`, `nvfp4_linear_add/5120x17408` | A16 |
+
+The FP8 crossover comes from two reversed-order cold-cache public-Linear repetitions on an
+RTX 4090 with CUDA 13.4.3: forced A8 was about 19% and 13% slower at T=18 and 32, then about
+22% and 21% faster at T=33 and 64. The [bounded crossover evidence](../profiles/bench/ada-fp8-nvfp4-cuda134/micro/fp8_crossover/)
+supports that shape's compiled switch; it is not a whole-model speed claim. The NVFP4 defaults
+retain A16 after the [initial comparison](../profiles/bench/ada-fp8-nvfp4-cuda134/micro/initial/)
+found broad Linear and small-T fused A8 losses. Its wide fused A8 gains used an older, slower
+A16 fallback and do not establish gains over the replacement optimized A16 routes.
+
+Overrides cannot bypass a Use's activation permission, the loaded native SM89 implementation,
+or the supported shape/width domain. In particular, the FP8 `5120x6144` A8 candidate starts at
+T=17 even when a band requests it earlier. `A16Only` and `--no-fp8-compute` retain A16 despite
+an `a8` profile band. Install the selection before querying workspace or capturing CUDA Graphs.
+The new optimized NVFP4 A16 routes and combined FP8/NVFP4 numerical batch have unresolved
+qualification failures; final timing is pending. Model throughput and KV capacity have not been
+established by these Op results.
 
 ## Batch composition
 

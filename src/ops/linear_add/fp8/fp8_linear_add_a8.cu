@@ -36,7 +36,8 @@ void launch_mma(const Weight& weight, Tensor& residual, Fp8A8Workspace workspace
     }
     fp8_mma_kernel<Geometry, Schedule, FullTokens>
         <<<blocks, Schedule::kThreads, Schedule::kSharedBytes, stream>>>(
-            workspace.codes, workspace.scales, static_cast<const std::uint8_t*>(weight.qdata),
+            workspace.codes, workspace.scales, workspace.centers,
+            static_cast<const std::uint8_t*>(weight.qdata),
             static_cast<const __nv_bfloat16*>(weight.scales), tokens, epilogue, destination);
     CUDA_CHECK(cudaGetLastError());
 }

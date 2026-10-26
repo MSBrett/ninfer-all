@@ -17,7 +17,6 @@ int run_nvfp4_a16() {
     for (int t : {3, 7, 11, 15, 19, 23, 27, 31, 33})
         invocations.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only, true});
     invocations.push_back({1, CallForm::A16Convenience});
-    invocations.push_back({33, CallForm::Policy, ops::LinearPolicy::AllowA8});
     int failures = 0;
     failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
                           {14336, 5120, 701U, Comparison::SampledRows, true, invocations});

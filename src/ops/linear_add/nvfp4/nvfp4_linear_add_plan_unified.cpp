@@ -1,4 +1,5 @@
 #include "core/weight.h"
+#include "ops/linear/nvfp4/nvfp4_a8_plan.h"
 #include "ops/linear_add/nvfp4/nvfp4_linear_add_plan_unified.h"
 
 #include "ops/linear/nvfp4/nvfp4_layout.h"
@@ -37,6 +38,13 @@ std::size_t nvfp4_linear_add_workspace_capacity_bytes(std::int32_t output_rows,
                                                       std::int32_t input_rows, LinearPolicy policy,
                                                       std::int32_t min_tokens,
                                                       std::int32_t max_tokens) {
+    if (allows_a8(policy) && current_device_ada_fp8()) {
+        if (min_tokens <= 0 || max_tokens < min_tokens)
+            throw std::invalid_argument("nvfp4 linear_add workspace: invalid interval");
+        (void)resolve_route(output_rows,input_rows,policy,min_tokens);
+        return nvfp4_ada_a8_capacity(policy,Nvfp4AdaOp::Add,output_rows,input_rows,min_tokens,max_tokens);
+    }
+
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("nvfp4 linear_add workspace: invalid token interval");
     }
@@ -49,6 +57,13 @@ std::size_t nvfp4_linear_add_workspace_capacity_bytes(std::int32_t output_rows,
 void nvfp4_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& residual,
                                LinearPolicy policy, WorkspaceArena& workspace,
                                cudaStream_t stream) {
+    if (nvfp4_uses_ada_a8(policy,Nvfp4AdaOp::Add,weight.n,weight.k,x.ne[1])) {
+        (void)resolve_route(weight.n,weight.k,policy,x.ne[1]);
+        nvfp4_a8_add_launch(x,weight,residual,workspace,stream);
+        return;
+    }
+    policy = nvfp4_ada_fallback_policy(policy);
+
     if (resolve_route(weight.n, weight.k, policy, x.ne[1]) == Nvfp4LinearAddRoute::A16) {
         nvfp4_linear_add_a16_launch(x, weight, residual, stream);
         return;

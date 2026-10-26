@@ -68,19 +68,22 @@ int run_fp8_a16() {
         vocabulary_invocations.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only, true});
     failures += run_shape("FP8_A16", ActivationCompute::A16, make_fp8_weight,
                           {248320, 5120, 823U, Comparison::SampledRows, true, vocabulary_invocations});
+    failures += run_shape("FP8_A16 proposal", ActivationCompute::A16, make_fp8_weight,
+                          {131072, 5120, 825U, Comparison::SampledRows, true, vocabulary_invocations});
     constexpr std::array vocabulary_policies{
         ops::LinearPolicy::A16Only,
         ops::LinearPolicy::AllowA8,
         ops::LinearPolicy::AllowA4,
     };
+    for (const std::int32_t vocabulary_rows : {131072, 248320})
     for (const ops::LinearPolicy policy : vocabulary_policies) {
         try {
             const std::size_t capacity = ops::linear_workspace_capacity_bytes(
-                QType::FP8_E4M3FN_ROW_BF16, 248320, 5120, policy, 1, 2048);
+                QType::FP8_E4M3FN_ROW_BF16, vocabulary_rows, 5120, policy, 1, 2048);
             // sm_70's wide route is the one A16 route that holds workspace (ops/linear/sm70).
             const std::size_t expected =
                 ops::detail::sm70::takes(2048)
-                    ? ops::detail::sm70::workspace_bytes(248320, 5120, 2048)
+                    ? ops::detail::sm70::workspace_bytes(vocabulary_rows, 5120, 2048)
                     : 0;
             if (capacity != expected) {
                 std::cerr << "FP8 vocabulary A16 route reported nonzero workspace\n";
@@ -123,7 +126,7 @@ int run_fp8_a16() {
     invalid.payload_bytes = invalid.payload_bytes - 1;
     expect_invalid("payload bound", invalid);
     for (auto [n, k] : {std::pair{14336, 5120}, std::pair{16384, 5120}, std::pair{34816, 5120},
-                        std::pair{248320, 5120}, std::pair{5120, 6144}, std::pair{5120, 17408}}) {
+                        std::pair{248320, 5120}, std::pair{131072, 5120}, std::pair{5120, 6144}, std::pair{5120, 17408}}) {
         failures += verify_workspace_envelopes(QType::FP8_E4M3FN_ROW_BF16, n, k);
     }
     return failures;

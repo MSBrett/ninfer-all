@@ -310,15 +310,14 @@ void launch_fp8_a8_tma_mma(const Fp8A8Operands& p, Output output, Epilogue epilo
                            cudaStream_t stream, float* partials = nullptr,
                            RowPolicy row_policy = {}) {
 #if defined(NINFER_SM8X_COMPAT) && !defined(NINFER_SM120_FP8)
-    // The TMA kernel needs cp.async.bulk.tensor, cluster-scope mbarriers and the block-scaled FP8
-    // MMA, none of which sm_8x has; A8 is never admitted there (see fp8_sm86_stubs.cpp).
+    // TMA and block-scaled MMA stay Blackwell-only; Ada selects cp.async MMA instead.
     (void)p;
     (void)output;
     (void)epilogue;
     (void)stream;
     (void)partials;
     (void)row_policy;
-    throw std::runtime_error("FP8 A8 execution requires an sm_100a or sm_120a GPU");
+    throw std::runtime_error("FP8 TMA execution requires an sm_120a image");
 #else
     validate_fp8_operands<Schedule>(p);
     if (p.rows % Schedule::kBlockRows || p.k % Schedule::kBlockK)

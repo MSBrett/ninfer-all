@@ -14,6 +14,7 @@ using Bulk      = Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<128, 256, 128, 2, 4
 } // namespace
 
 std::size_t fp8_attn_input_partial_capacity_bytes(std::int32_t max_tokens) {
+    if (current_device_ada_fp8()) return 0;
     return max_tokens > 384 ? Bulk::kPartialBytes : 0;
 }
 
@@ -22,6 +23,12 @@ void fp8_attn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& q, 
                               cudaStream_t stream) {
     require_fp8_a8_card();
     launch_fp8_a8_quantize(x, weight, workspace, stream);
+    fp8_attn_input_a8_prequantized_launch(x, weight, q, gate, key, value, workspace, stream);
+}
+
+void fp8_attn_input_a8_prequantized_launch(const Tensor& x, const Weight& weight, Tensor& q,
+                                           Tensor& gate, Tensor& key, Tensor& value,
+                                           Fp8A8Workspace workspace, cudaStream_t stream) {
     const Fp8AttentionInputOutput output{
         static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(key.data),
         static_cast<__nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(value.data)};
@@ -35,6 +42,10 @@ void fp8_attn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& q, 
             launch_fp8_a8_mma<S>(operands, output, LinearIdentityEpilogue{}, stream, {},
                                  pdl::Dependency::Programmatic);
     };
+    if (current_device_ada_fp8()) {
+        if (x.ne[1] <= 32) return launch.template operator()<Fp8A8T32R32K128>();
+        return launch.template operator()<Fp8A8T64R128K128>();
+    }
     if (x.ne[1] <= 32) return launch.template operator()<Fp8A8T32R32K128>();
     if (x.ne[1] <= 96) return launch.template operator()<Fp8A8T32R128K128>();
     if (x.ne[1] <= 128) return launch.template operator()<Tma64x128>();

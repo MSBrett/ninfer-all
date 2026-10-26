@@ -301,6 +301,7 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     engine_options.wddm_evictable_budget    = options.wddm_evictable_budget;
     engine_options.suspend                  = options.suspend;
     engine_options.mlp_a8_decode            = options.mlp_a8_decode;
+    engine_options.no_fp8_compute           = options.no_fp8_compute;
     engine_options.prefill_a8               = options.prefill_a8;
     engine_options.prefill_cublas           = options.prefill_cublas;
     engine_options.prefill_cublas_projections = options.prefill_cublas_projections;

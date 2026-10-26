@@ -64,6 +64,32 @@ std::size_t fp8_attn_input_workspace_capacity_bytes(LinearPolicy policy, std::in
         });
 }
 
+bool fp8_attn_input_fused_rmsnorm_eligible(LinearPolicy policy, std::int32_t tokens) {
+    if (tokens <= 0 || !allows_a8(policy) || !current_device_ada_fp8()) return false;
+    return fused_route_table("unified/fp8_attn_input", tokens) == LinearRouteTable::Unified
+               ? unified::fp8_attn_input_uses_a8(policy, tokens)
+               : resolve_route(policy, tokens) == Fp8AttnInputRoute::A8;
+}
+
+void fp8_attn_input_fused_rmsnorm_dispatch(
+    const Tensor& input, const Tensor& norm_weight, float eps, const Weight& weight,
+    Tensor& q, Tensor& gate, Tensor& k, Tensor& v, LinearPolicy policy,
+    WorkspaceArena& workspace, cudaStream_t stream, const Tensor* residual, Tensor* residual_sum) {
+    if (!fp8_attn_input_fused_rmsnorm_eligible(policy, input.ne[1]))
+        throw std::invalid_argument("fused RMSNorm FP8 requires a selected Ada A8 attention route");
+    const bool use_unified = fused_route_table("unified/fp8_attn_input", input.ne[1]) ==
+                             LinearRouteTable::Unified;
+    auto scope = workspace.scope();
+    const auto scratch = allocate_fp8_a8_workspace(
+        workspace, input.ne[1], weight.k,
+        use_unified ? unified::fp8_attn_input_partial_capacity_bytes(input.ne[1]) : 0);
+    launch_fp8_a8_fused_rmsnorm(input, norm_weight, eps, scratch, stream, residual, residual_sum);
+    if (use_unified)
+        unified::fp8_attn_input_a8_prequantized_launch(input, weight, q, gate, k, v, scratch, stream);
+    else
+        fp8_attn_input_a8_prequantized_launch(input, weight, q, gate, k, v, scratch, stream);
+}
+
 void fp8_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                              Tensor& k, Tensor& v, LinearPolicy policy, WorkspaceArena* workspace,
                              cudaStream_t stream) {

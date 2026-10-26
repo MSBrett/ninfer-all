@@ -79,6 +79,44 @@ def test_proposal_gathered_from_a_rotated_head_keeps_its_rotation(tmp_path):
     )
 
 
+def test_encoded_proposal_keeps_per_input_permissions_and_calibration(tmp_path):
+    rows, k = 8, 128
+    codes = torch.zeros((rows, k // 2), dtype=torch.uint8)
+    scales = torch.full((rows, k // 16), 0x38, dtype=torch.uint8)
+    divisor = struct.pack("<f", 0.25)
+    source = LogicalSource(
+        (rows, k), "NVFP4 head", lambda begin, end: torch.zeros(end - begin),
+        lambda begin, end: EncodedRows("nvfp4", codes[begin:end], scales[begin:end], divisor),
+        lambda: divisor, lambda: struct.pack("<f", 0.5),
+    )
+    model = Model({"text": {"config": {"vocab_size": rows}},
+                   "mtp": {"config": {}, "target": "text"},
+                   "dflash2": {"config": {}, "target": "text"}}, token_count=rows)
+    model.add(Parameter("text/output_head", source.shape, source,
+                        inputs=("text/final_hidden", "mtp/final_hidden", "dflash2/final_hidden")))
+    ranking = tmp_path / "ranking.i64"
+    np.arange(rows, dtype="<i8").tofile(ranking)
+    recipe = Recipe(model)
+    recipe.assign("text/output_head", format="nvfp4", method=import_encoded,
+                  activation_policy="AllowA4")
+    recipe.use("text/output_head", "mtp/final_hidden", activation_policy="AllowA8",
+               auxiliaries={"activation_input_divisor": 3.0})
+    recipe.use("text/output_head", "dflash2/final_hidden",
+               auxiliaries={"activation_input_divisor": 5.0})
+    add_official_proposal(recipe, ranking=ranking, rows=3)
+    assert recipe.policies[("proposal/head", "mtp/final_hidden")] == "AllowA8"
+    assert recipe.policies[("proposal/head", "dflash2/final_hidden")] == "AllowA4"
+    for backend, divisor in (("mtp", 3.0), ("dflash2", 5.0)):
+        assert recipe.auxiliary_overrides[("proposal/head", backend + "/final_hidden",
+                                           "activation_input_divisor")].data == struct.pack("<f", divisor)
+    # Editing the derived Use must not alter the source head's calibration.
+    recipe.use("proposal/head", "mtp/final_hidden", activation_policy="A16Only",
+               auxiliaries={"activation_input_divisor": 7.0})
+    assert recipe.policies[("text/output_head", "mtp/final_hidden")] == "AllowA8"
+    assert recipe.auxiliary_overrides[("text/output_head", "mtp/final_hidden",
+                                       "activation_input_divisor")].data == struct.pack("<f", 3.0)
+
+
 def test_proposal_of_an_imported_head_keeps_its_exact_rows_and_encoding(tmp_path):
     rows, k = 8, 128
     codes = torch.arange(rows * k // 4, dtype=torch.int32).reshape(rows, k // 4).to(torch.uint8)

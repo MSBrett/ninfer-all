@@ -1,4 +1,5 @@
 #include "core/weight.h"
+#include "ops/linear/nvfp4/nvfp4_a8_plan.h"
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan_unified.h"
 
 #include "core/layout.h"
@@ -16,6 +17,7 @@ namespace {
 enum class Nvfp4LinearSwiGluRoute {
     DecodeFusedA16,
     SmallTFusedA16,
+    FullTFusedA16,
     FusedA4,
     TmaFusedA4,
 };
@@ -28,7 +30,7 @@ Nvfp4LinearSwiGluRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8) {
         if (tokens == 1) { return Nvfp4LinearSwiGluRoute::DecodeFusedA16; }
         if (tokens <= 16) { return Nvfp4LinearSwiGluRoute::SmallTFusedA16; }
-        throw std::invalid_argument("nvfp4 linear_swiglu A16 is registered only through T=16");
+        return Nvfp4LinearSwiGluRoute::FullTFusedA16;
     }
     if (tokens == 1) { return Nvfp4LinearSwiGluRoute::DecodeFusedA16; }
     if (tokens <= 4) { return Nvfp4LinearSwiGluRoute::SmallTFusedA16; }
@@ -54,6 +56,12 @@ std::size_t fused_workspace_bytes(std::int32_t tokens) {
 std::size_t nvfp4_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy,
                                                          std::int32_t min_tokens,
                                                          std::int32_t max_tokens) {
+    if (min_tokens <= 0 || max_tokens < min_tokens || !valid_linear_policy(policy))
+        throw std::invalid_argument("nvfp4 linear_swiglu workspace: invalid interval/policy");
+    if (allows_a8(policy) && current_device_ada_fp8())
+        return nvfp4_ada_a8_capacity(policy,Nvfp4AdaOp::SwiGlu,34816,5120,min_tokens,max_tokens);
+    if (!allows_a4(policy)) return 0;
+
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("nvfp4 linear_swiglu workspace: invalid token interval");
     }
@@ -69,12 +77,27 @@ std::size_t nvfp4_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy,
 void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor& out,
                                   LinearPolicy policy, WorkspaceArena& workspace,
                                   cudaStream_t stream) {
+    if (x.ne[1] <= 0 || !valid_linear_policy(policy))
+        throw std::invalid_argument("nvfp4 linear_swiglu: invalid T/policy");
+    if (nvfp4_uses_ada_a8(policy,Nvfp4AdaOp::SwiGlu,weight.n,weight.k,x.ne[1])) {
+        nvfp4_a8_swiglu_launch(x,weight,out,workspace,stream);
+        return;
+    }
+    policy = nvfp4_ada_fallback_policy(policy);
+    if (!allows_a4(policy) && (x.ne[1] > 16 || weight.weight_divisor_rows < weight.n)) {
+        nvfp4_a16_swiglu_full_launch(x,weight,out,stream);
+        return;
+    }
+
     switch (resolve_route(policy, x.ne[1])) {
     case Nvfp4LinearSwiGluRoute::DecodeFusedA16:
         nvfp4_linear_swiglu_decode_launch(x, weight, out, stream);
         return;
     case Nvfp4LinearSwiGluRoute::SmallTFusedA16:
         nvfp4_linear_swiglu_small_t_launch(x, weight, out, stream);
+        return;
+    case Nvfp4LinearSwiGluRoute::FullTFusedA16:
+        nvfp4_a16_swiglu_full_launch(x,weight,out,stream);
         return;
     case Nvfp4LinearSwiGluRoute::FusedA4:
         nvfp4_linear_swiglu_a4_launch(x, weight, out, workspace, stream);

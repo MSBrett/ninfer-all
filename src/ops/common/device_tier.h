@@ -33,6 +33,11 @@ enum class DeviceTier : std::uint8_t {
     Blackwell,
 };
 
+struct DeviceExecutionCapabilities {
+    DeviceTier tier;
+    bool ada_fp8 = false;
+};
+
 // The tiers this binary carries code for (set by CMake from CMAKE_CUDA_ARCHITECTURES).
 #if defined(NINFER_TIER_VOLTA)
 inline constexpr bool kBuildVolta = true;
@@ -54,6 +59,15 @@ inline constexpr bool kBuildBlackwell = true;
 #else
 inline constexpr bool kBuildBlackwell = false;
 #endif
+#if defined(NINFER_SM89_FP8)
+inline constexpr bool kBuildAdaFp8 = true;
+#else
+inline constexpr bool kBuildAdaFp8 = false;
+#endif
+// FP8 capability follows the loaded image: 86 and 89 share ordinary schedules.
+[[nodiscard]] bool device_ada_fp8(int device);
+[[nodiscard]] bool current_device_ada_fp8();
+
 inline constexpr int kBuildTiers =
     int(kBuildVolta) + int(kBuildTuring) + int(kBuildAmpere) + int(kBuildBlackwell);
 static_assert(kBuildTiers >= 1, "CMake defines the tier of every architecture it builds");
@@ -95,6 +109,17 @@ inline constexpr bool kBuildPostVolta = kBuildTuring || kBuildAmpere || kBuildBl
 [[nodiscard]] inline bool current_device_blackwell() {
     if constexpr (!kBuildBlackwell) { return false; }
     return current_device_tier() == DeviceTier::Blackwell;
+}
+
+[[nodiscard]] inline bool current_device_fp8() {
+    return current_device_ada_fp8() || current_device_blackwell();
+}
+
+[[nodiscard]] inline DeviceExecutionCapabilities device_capabilities(int device) {
+    return {device_tier(device), device_ada_fp8(device)};
+}
+[[nodiscard]] inline DeviceExecutionCapabilities current_device_capabilities() {
+    return {current_device_tier(), current_device_ada_fp8()};
 }
 
 // Kernel shapes come in two sets. Turing's are sized for its 64 KiB of shared memory per block;

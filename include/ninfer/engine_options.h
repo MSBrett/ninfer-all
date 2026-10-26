@@ -526,6 +526,9 @@ struct EngineOptions {
     // Integer-activation MLP gate_up at decode and verify widths. Measured 4-6% off that Op from
     // sixteen columns up; see docs/maintainer/quality-trade-experiments.md.
     bool mlp_a8_decode                     = false;
+    // Keep stored FP8/NVFP4 weights compact but cap their floating activation
+    // compute routes at A16. Integer-activation route controls are independent.
+    bool no_fp8_compute                    = false;
     // Integer-activation routes at full prefill tiles, on by default where a route is registered.
     // Clearing it returns prefill to the A16 routes, which is the only way to measure what the
     // integer routes are worth on a whole request rather than per Op.

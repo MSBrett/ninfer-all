@@ -191,18 +191,25 @@ void logical_data_and_instances() {
     require(plan.parameter(plan.weights().text.token_embedding).binding.parts[0].object ==
                 plan.parameter(plan.weights().text.output_head).binding.parts[0].object,
             "explicit shared embedding/head did not bind the same parent");
-    // A stored A4 permission stays only for a weight whose rank runs the 120a code; elsewhere the
-    // weight takes its A16 route.
+    // Stored permissions narrow to each rank: Ada may use FP8 operands, Ampere stays A16,
+    // and Blackwell may retain native A4.
     const auto query_policy = [](const qwen::LoadPlan& loaded) {
         const auto& mixer = std::get<qwen::AttentionWeights>(loaded.weights().text.layers[0].mixer);
         return loaded.uses(mixer.query)[0].policy;
     };
-    require(query_policy(qwen::plan_load(reader, {}, {}, {ops::DeviceTier::Ampere})) ==
+    require(query_policy(qwen::plan_load(reader, {}, {}, {{ops::DeviceTier::Ampere, false}})) ==
                 ops::LinearPolicy::A16Only,
             "a rank without the 120a code kept an A4 permission");
-    require(query_policy(qwen::plan_load(reader, {}, {}, {ops::DeviceTier::Blackwell})) ==
+    require(query_policy(qwen::plan_load(reader, {}, {}, {{ops::DeviceTier::Blackwell, false}})) ==
                 (ops::kBuildBlackwell ? ops::LinearPolicy::AllowA4 : ops::LinearPolicy::A16Only),
-            "a rank running the 120a code lost an A4 permission");
+            "rank activation policy disagrees with the built Blackwell image");
+    require(query_policy(qwen::plan_load(reader, {}, {}, {{ops::DeviceTier::Ampere, true}})) ==
+                (ops::kBuildAdaFp8 ? ops::LinearPolicy::AllowA8 : ops::LinearPolicy::A16Only),
+            "an Ada rank did not narrow its A4 permission to supported A8 compute");
+    require(query_policy(qwen::plan_load(reader, {.no_fp8_compute = true}, {},
+                                         {{ops::DeviceTier::Ampere, true}})) ==
+                ops::LinearPolicy::A16Only,
+            "--no-fp8-compute did not cap the Ada floating activation policy");
     const auto capacity = plan.materialization().device_capacity(0);
     require(!plan.weights().vision && plan.resources().preprocessor_config_json.empty(),
             "unused Vision was required");

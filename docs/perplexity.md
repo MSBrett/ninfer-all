@@ -36,7 +36,10 @@ DeepSeek-V4.1 and Qwen3.8-Flash-Next, its Qwen3.8-Flash-Next n-gram options (`--
 `--ngram-lock`, `--no-ngram-table`; DeepSeek-V4.1's Engram table takes all but `ram-hot` and
 `--ngram-hot-profile`) and `--kv-resident` (streamed sparse-attention KV), and its
 precision options (`--prefill-cublas`, `--lm-head-q4/q6`, `--embedding-q4/q6`, `--gdn-state-fp16`,
-`--mlp-a8-decode`, `--no-prefill-a8`).
+`--mlp-a8-decode`, `--no-prefill-a8`, `--no-fp8-compute`). The last option caps
+FP8/NVFP4 weight projections at A16 activation compute while retaining their compressed
+storage, so the same artifact can be scored with and without floating FP8 activation
+rounding. It leaves integer A8 controls independent and is off by default.
 
 ```bash
 ./build/apps/ninfer-perplexity models/qwen3_8_27b.ninfer \
@@ -184,4 +187,5 @@ aggregate.
 
 The schema-v4 report identifies the artifact's architecture, public name, actual weight formats
 and prefill signature alongside the workload and numerical results; its execution configuration
-records `rope_yarn`, `rope_yarn_factor`, `rope_scaling_factor` and `rope_scaling_original_context`.
+records `rope_yarn`, `rope_yarn_factor`, `rope_scaling_factor`, `rope_scaling_original_context`
+and `no_fp8_compute`.

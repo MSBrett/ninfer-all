@@ -34,6 +34,17 @@ void fp8_attn_input_small_t_launch(const Tensor& x, const Weight& weight, Tensor
 void fp8_attn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                               Tensor& k, Tensor& v, Fp8A8Workspace workspace, cudaStream_t stream);
 
+void fp8_attn_input_a8_prequantized_launch(const Tensor& x, const Weight& weight, Tensor& q,
+                                           Tensor& gate, Tensor& k, Tensor& v,
+                                           Fp8A8Workspace workspace, cudaStream_t stream);
+
+[[nodiscard]] bool fp8_attn_input_fused_rmsnorm_eligible(LinearPolicy policy,
+                                                        std::int32_t tokens);
+void fp8_attn_input_fused_rmsnorm_dispatch(
+    const Tensor& input, const Tensor& norm_weight, float eps, const Weight& weight,
+    Tensor& q, Tensor& gate, Tensor& k, Tensor& v, LinearPolicy policy,
+    WorkspaceArena& workspace, cudaStream_t stream, const Tensor* residual, Tensor* residual_sum);
+
 void fp8_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                              Tensor& k, Tensor& v, LinearPolicy policy, WorkspaceArena* workspace,
                              cudaStream_t stream);

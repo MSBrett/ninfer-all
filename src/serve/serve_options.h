@@ -119,6 +119,7 @@ struct ServeOptions {
 
     [[nodiscard]] bool router() const noexcept { return models_dir || models_preset; }
     bool mlp_a8_decode      = false;
+    bool no_fp8_compute     = false;
     bool prefill_a8         = true;
     bool prefill_cublas     = false;
     bool prefill_cublas_projections = true;

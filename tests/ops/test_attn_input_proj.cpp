@@ -6,6 +6,7 @@
 #include "core/decode_graph.h"
 #include "ops/direct_bf16_weight.h"
 #include "ops/input_projection_test_common.h"
+#include "ops/linear/common/route_table.h"
 #include "ops/linear/sm70/sm70_project.h"
 
 #include <cuda_runtime.h>
@@ -66,10 +67,18 @@ WeightView rows(const WeightParent& parent, std::uint64_t begin, std::uint64_t c
 
 int run_target_projection_case(DevicePackedWeight& parent, DevicePackedWeight* gate_value,
                                int tokens, ops::LinearPolicy policy, bool replay = false,
-                               bool full_reference = false) {
+                               bool full_reference = false, bool affine_input = false) {
     constexpr int hidden = 5120, qrows = 6144, kvrows = 1024;
     const bool dual      = gate_value != nullptr;
     auto activation      = make_bf16_activation(hidden, tokens, 101U + tokens);
+    if (affine_input)
+        for (int token = 0; token < tokens; ++token)
+            for (int col = 0; col < hidden; ++col) {
+                auto& value = activation[std::size_t(token) * hidden + col];
+                if (token % 4 == 0) value = 0.0F;
+                if (token % 4 == 1) value = 0.25F;
+                if (token % 4 == 2) value = 0.25F + float(col % 8) * (1.0F / 32.0F);
+            }
     auto activation_bits = bf16_bits(activation);
     DeviceBuffer input   = to_device(activation_bits);
     GuardedBf16Tensor query(qrows, tokens), gate(qrows, tokens), key(kvrows, tokens),
@@ -562,6 +571,20 @@ int run_fp8_target() {
                 return run_target_projection_case(parent, nullptr, t, policy, true);
             });
     }
+    if (ops::current_device_ada_fp8()) {
+        struct RestoreTable {
+            ~RestoreTable() { ops::detail::force_linear_route_table(std::nullopt); }
+        } restore;
+        for (auto table : {ops::detail::LinearRouteTable::Legacy,
+                           ops::detail::LinearRouteTable::Unified}) {
+            ops::detail::force_linear_route_table(table);
+            // Wide and partial token tiles must exercise the real Ada A8 path under both tables.
+            // Run directly: an unsupported-architecture refusal here is a failure.
+            for (int t : {17, 33, 64, 65, 129, 257, 1025, 2048})
+                failures += run_target_projection_case(
+                    parent, nullptr, t, ops::LinearPolicy::AllowA8, t != 2048, false, true);
+        }
+    }
     return failures;
 }
 
@@ -728,8 +751,9 @@ int run_weight_inputs() {
 int main(int argc, char** argv) {
     const bool dflash2_only = argc == 2 && std::string(argv[1]) == "--dflash2-only";
     const bool inputs_only  = argc == 2 && std::string(argv[1]) == "--weight-inputs-only";
-    if (argc != 1 && !dflash2_only && !inputs_only) {
-        std::cerr << "usage: ninfer_attn_input_proj_test [--dflash2-only|--weight-inputs-only]\n";
+    const bool fp8_only = argc == 2 && std::string(argv[1]) == "--fp8-only";
+    if (argc != 1 && !dflash2_only && !inputs_only && !fp8_only) {
+        std::cerr << "usage: ninfer_attn_input_proj_test [--dflash2-only|--weight-inputs-only|--fp8-only]\n";
         return 2;
     }
     if (cuda_unavailable()) {
@@ -738,6 +762,11 @@ int main(int argc, char** argv) {
     }
 
     int failures = 0;
+    if (fp8_only) {
+        failures = run_fp8_target();
+        std::cout << (failures == 0 ? "OK" : "FAIL") << " FP8 attn_input_proj\n";
+        return failures == 0 ? 0 : 1;
+    }
     if (inputs_only) { return run_weight_inputs() == 0 ? 0 : 1; }
     if (!dflash2_only) {
         failures += run_q4_q5();

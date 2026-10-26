@@ -234,15 +234,15 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
             } else {
                 if (local_token < live_columns) {
                     destination.store(row_a, token0,
-                                      epilogue.apply(row_a, token0, sum.x * top_scale));
+                                      epilogue.apply_scaled(row_a, token0, sum.x, top_scale));
                     destination.store(row_b, token0,
-                                      epilogue.apply(row_b, token0, sum.z * bottom_scale));
+                                      epilogue.apply_scaled(row_b, token0, sum.z, bottom_scale));
                 }
                 if (local_token + 1 < live_columns) {
                     destination.store(row_a, token0 + 1,
-                                      epilogue.apply(row_a, token0 + 1, sum.y * top_scale));
+                                      epilogue.apply_scaled(row_a, token0 + 1, sum.y, top_scale));
                     destination.store(row_b, token0 + 1,
-                                      epilogue.apply(row_b, token0 + 1, sum.w * bottom_scale));
+                                      epilogue.apply_scaled(row_b, token0 + 1, sum.w, bottom_scale));
                 }
             }
         }

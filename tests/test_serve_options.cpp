@@ -303,18 +303,22 @@ int main() {
     // Every one of these parses without error whether or not the service carries it to the Engine,
     // so the mapping from parsed options to Engine options is what has to be checked.
     const ninfer::EngineOptions default_engine = make_engine_options(defaults);
-    failures += check(!default_engine.prefill_cublas && default_engine.prefill_cublas_projections &&
+    failures += check(!default_engine.no_fp8_compute && !default_engine.prefill_cublas &&
+                          default_engine.prefill_cublas_projections &&
                           default_engine.speculative.lookup_ngram == 0,
                       "the cuBLAS prefill route or context lookup is on by default in serving");
     const ServeOptions route =
         parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3",
-               "--lookup-ngram", "5", "--prefill-cublas", "--no-prefill-cublas-projections"});
+               "--lookup-ngram", "5", "--prefill-cublas", "--no-prefill-cublas-projections",
+               "--no-fp8-compute", "--mlp-a8-decode"});
     const ninfer::EngineOptions route_engine = make_engine_options(route);
     failures += check(route_engine.speculative.lookup_ngram == 5 &&
                           route_engine.speculative.backend == ninfer::SpeculativeBackend::Mtp &&
                           route_engine.speculative.draft_tokens == 3,
                       "--lookup-ngram did not reach the Engine options next to --spec");
-    failures += check(route_engine.prefill_cublas && !route_engine.prefill_cublas_projections,
+    failures += check(route_engine.no_fp8_compute && route_engine.mlp_a8_decode &&
+                          route_engine.prefill_a8 && route_engine.prefill_cublas &&
+                          !route_engine.prefill_cublas_projections,
                       "the cuBLAS prefill controls did not reach the Engine options");
     for (const char* flag : {"--prefill-cublas", "--no-prefill-cublas-projections", "--lookup-ngram"}) {
         failures += check(kv_help.find(flag) != std::string::npos,
@@ -1175,6 +1179,7 @@ int main() {
                                         "--ngram-session-mib",
                                         "--no-cuda-graph",
                                         "--no-endpoint-anchors",
+                                        "--no-fp8-compute",
                                         "--no-prefill-a8",
                                         "--no-prefill-cublas-projections",
                                         "--no-prefix-reuse",

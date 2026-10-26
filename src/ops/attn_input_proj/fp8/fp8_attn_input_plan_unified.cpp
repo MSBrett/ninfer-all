@@ -36,6 +36,10 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate, 
 
 } // namespace
 
+bool fp8_attn_input_uses_a8(LinearPolicy policy, std::int32_t tokens) {
+    return resolve_route(policy, tokens) == Fp8AttnInputRoute::A8;
+}
+
 std::size_t fp8_attn_input_workspace_capacity_bytes(LinearPolicy policy, std::int32_t min_tokens,
                                                     std::int32_t max_tokens) {
     if (min_tokens <= 0 || max_tokens < min_tokens) {

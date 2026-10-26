@@ -149,6 +149,8 @@ std::string serve_usage_text(const char* argv0) {
            "  --no-prefill-cublas-projections\n"
            "                                with --prefill-cublas, keep the attention and\n"
            "                                GDN input projections off that route\n"
+           "  --no-fp8-compute              use A16 activations for FP8/NVFP4 weights;\n"
+           "                                retain their compressed storage\n"
            "  --no-prefill-a8               prefill every projection on the A16 routes\n"
            "                                instead of the integer-activation ones\n"
            "  --mlp-a8-decode               integer-activation MLP gate_up at decode and\n"
@@ -1424,6 +1426,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         }
         if (arg == "--mlp-a8-decode") {
             options.mlp_a8_decode = true;
+            continue;
+        }
+        if (arg == "--no-fp8-compute") {
+            options.no_fp8_compute = true;
             continue;
         }
         if (arg == "--no-prefill-a8") {

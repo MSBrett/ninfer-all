@@ -7,13 +7,14 @@ named by `--api-key-env` (default `NINFER_API_KEY`).
 
 ## Dashboard: `monitor.py`
 
-Samples `/stats`, `nvidia-smi` and `/proc` every `--interval` seconds (default 5), tails the
+Samples `/stats`, `nvidia-smi` and host CPU/RAM every `--interval` seconds (default 5), tails the
 server's `--request-log-jsonl` file, and serves a self-contained dashboard: scheduler occupancy,
 admitted requests, decode and prefill throughput, Device and Host KV use, speculative acceptance,
 TTFT and processing time (TTFT less queue wait), GPU, CPU and RAM, KV and state transfers,
 pressure events (evictions, demotions, degradations, fallbacks), cache-reuse paths, and the recent
 requests. Hybrid host-cache usage and capacity come from `context_cache.hybrid.host_used_bytes`
-and `host_capacity_bytes`, including both KV blocks and state snapshots. The legacy cache uses
+and `host_capacity_bytes`, including both KV blocks and state snapshots. Before the first
+cache sample, the startup record supplies the configured hybrid budget and mode. The legacy cache uses
 its separate host-KV capacity and state slots. `/api/samples` returns the same state as JSON and
 `/healthz` answers `ok`.
 
@@ -25,6 +26,18 @@ python3 tools/monitor/monitor.py --stats-url http://127.0.0.1:8081 \
 The dashboard binds `127.0.0.1` unless `--bind` says otherwise. The last 4320 samples (6 hours at
 5 s) are kept in memory. A sidecar restart replays existing request-log records to restore
 request metrics; sampled chart history starts again at the restart.
+
+Host counters use Linux `/proc` or Windows `GetSystemTimes` and `GlobalMemoryStatusEx`, with no
+extra dependencies. CPU is busy time over each sampling interval; the first sample has no CPU
+value yet. On Windows systems with more than 64 logical processors it covers the monitor thread's
+primary processor group. The RAM tile shows physical memory used as a percentage and used/total
+GiB; the CPU & RAM chart plots both percentages. Failed reads show an unavailable value.
+
+Run the monitor's regression suite with Python 3.11:
+
+```bash
+python3.11 -m unittest discover -s tests/monitor
+```
 
 `--sensor-command` adds a temperature reading: a command that prints one Celsius value, run every
 tick, drawn against `--sensor-warn-c` and `--sensor-critical-c` under `--sensor-label`. With

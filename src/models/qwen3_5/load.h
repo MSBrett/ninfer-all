@@ -39,20 +39,20 @@ private:
     std::unique_ptr<Impl> impl_;
     explicit LoadPlan(std::unique_ptr<Impl> impl);
     friend LoadPlan plan_load(const artifact::Reader&, LoadOptions, std::filesystem::path,
-                              std::vector<ops::DeviceTier>);
+                              std::vector<ops::DeviceExecutionCapabilities>);
     friend std::unique_ptr<Model> materialize_model(LoadPlan&&, DeviceContext&,
                                                     const StartupObserver*,
                                                     const artifact::MaterializeOptions&);
 };
 
-// `rank_tiers` holds the code tier of each pipeline rank's device (ops/common/device_tier.h), which
-// decides the stored layout of the projection weights that rank reads; empty takes the current
-// device's tier for every rank.
+// Rank capabilities describe the loaded code tier and its optional FP8 instructions.
+// Ada and Ampere share layout routes but differ in FP8 compute. Empty takes the current
+// device capabilities for every rank.
 [[nodiscard]] LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options = {},
-                                 std::filesystem::path artifact_path     = {},
-                                 std::vector<ops::DeviceTier> rank_tiers = {});
-// The code tier of each rank's device, in rank order.
-[[nodiscard]] std::vector<ops::DeviceTier> rank_tiers(const DeviceContext& device);
+                                 std::filesystem::path artifact_path = {},
+                                 std::vector<ops::DeviceExecutionCapabilities> rank_capabilities = {});
+[[nodiscard]] std::vector<ops::DeviceExecutionCapabilities>
+rank_capabilities(const DeviceContext& device);
 // How many layers each of `free_bytes.size()` pipeline stages should own so that the most KV cache
 // fits on every device at once, given the bytes free on each. Sized from the artifact's stored
 // layers; the head stage (rank 0) also carries the embedding, head and round buffers. The default

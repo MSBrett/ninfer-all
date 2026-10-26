@@ -71,6 +71,7 @@ struct ShapeCase {
     bool verify_input_preservation;
     std::span<const Invocation> invocations;
     ActivationSigns activation_signs = ActivationSigns::Centered;
+    bool require_supported = false;
 };
 
 using WeightGenerator = quantized_weight::PackedWeight (*)(std::int32_t, std::int32_t,

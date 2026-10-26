@@ -4,6 +4,8 @@
 
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
+#include "ops/linear/common/route_table.h"
+#include "ops/common/device_tier.h"
 
 #include <cuda_runtime.h>
 
@@ -12,13 +14,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
 
-// The A8 workspace contracts describe the parts that run FP8 A8 (its TMA split-K partials are
-// sized there); an sm_8x build never admits A8 and does not carry those schedules.
-#if defined(NINFER_SM8X_COMPAT) && !defined(NINFER_SM120_FP8)
+// Ada reserves row-quantized activations; Blackwell may also reserve TMA split-K partials.
+#if defined(NINFER_SM8X_COMPAT) && !defined(NINFER_SM120_FP8) && !defined(NINFER_SM89_FP8)
 constexpr bool kA8Executable = false;
 #else
 constexpr bool kA8Executable = true;
@@ -68,7 +70,8 @@ std::vector<std::uint16_t> make_activation(std::int32_t rows, std::int32_t token
             value ^= value >> 15;
             const float represented =
                 static_cast<float>(static_cast<int>(value & 0xffU) - 128) * (1.0F / 256.0F);
-            result[static_cast<std::size_t>(token) * rows + row] = f32_to_bf16(represented);
+            result[static_cast<std::size_t>(token) * rows + row] =
+                f32_to_bf16(token % 17 == 16 ? 0.0F : represented);
         }
     }
     return result;
@@ -205,7 +208,7 @@ int run_shape(std::int32_t n, std::int32_t k, std::int32_t first_a8, std::uint32
             ops::linear_add(x, weight, residual, invocation.policy, workspace, nullptr);
             cuda_check(cudaDeviceSynchronize(), "synchronize FP8 linear_add");
         } catch (const std::exception& error) {
-            if (!unsupported_arch_refusal(error)) { throw; }
+            if (a8_execution_available() || !unsupported_arch_refusal(error)) { throw; }
             std::cout << "SKIP FP8 linear_add T=" << invocation.tokens << ": "
                       << error.what() << "\n";
             continue;
@@ -318,12 +321,122 @@ int run_shape(std::int32_t n, std::int32_t k, std::int32_t first_a8, std::uint32
         QType::FP8_E4M3FN_ROW_BF16, n, k, ops::LinearPolicy::AllowA8, 1, 1024);
     const std::size_t exact_1024 = ops::linear_add_workspace_capacity_bytes(
         QType::FP8_E4M3FN_ROW_BF16, n, k, ops::LinearPolicy::AllowA8, 1024, 1024);
-    if (kA8Executable && (a16_interval != 0 || pre_boundary != 0 || hot_interval != exact_48 ||
-                          through_1024 != exact_1024 || exact_1024 <= exact_48)) {
+    const auto widest = [&](std::int32_t first, std::int32_t last) {
+        std::size_t maximum = 0;
+        for (auto t = first; t <= last; ++t)
+            maximum = std::max(maximum, ops::linear_add_workspace_capacity_bytes(
+                QType::FP8_E4M3FN_ROW_BF16, n, k, ops::LinearPolicy::AllowA8, t, t));
+        return maximum;
+    };
+    if (kA8Executable && (a16_interval != 0 || pre_boundary != 0 ||
+                          hot_interval != widest(1, 48) ||
+                          through_1024 != widest(1, 1024) || exact_1024 <= exact_48)) {
         std::cerr << "FP8 linear_add [" << n << ',' << k
                   << "]: workspace interval contract mismatch\n";
         ++failures;
     }
+    return failures;
+}
+
+// Dense represented inputs give the affine quantizer nonzero centers, while
+// deliberately unbalanced sparse weights make the center correction observable.
+// The oracle decodes stored weights and uses original BF16 inputs, never codes
+// or scales from the private activation quantizer.
+int check_affine_center_replay(int k) {
+    if (!ops::current_device_ada_fp8()) return 0;
+    constexpr int n=5120;
+    constexpr auto policy=ops::LinearPolicy::AllowA8;
+    const std::array<int,8> columns{0,1,15,16,k/2,k-3,k-2,k-1};
+    constexpr std::array<std::uint8_t,8> codes{0x38,0xb0,0x40,0xb8,0x28,0x34,0x30,0x44};
+    auto packed=quantized_weight::make_patterned_weight(QType::FP8_E4M3FN_ROW_BF16,n,k,891U);
+    std::fill(packed.payload.begin(),packed.payload.end(),0);
+    for (int row=0;row<n;++row) {
+        for (int i=0;i<8;++i)
+            packed.payload[static_cast<std::size_t>(row)*k+columns[i]]=
+                codes[(i+row)%8] ^ (row%3==0 ? 0x80U : 0U);
+        quantized_weight::detail::store_u16_le(packed.payload,
+            packed.scale_plane_offset+static_cast<std::size_t>(row)*2,
+            f32_to_bf16((1.0F+static_cast<float>(row%7)/8.0F)/64.0F));
+    }
+    GuardedDeviceBuffer weights(packed.payload.size());
+    weights.copy_from_host(packed.payload.data(),packed.payload.size());
+    const Weight weight=packed.device_weight(weights.data());
+    cudaStream_t stream=nullptr;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking));
+    int failures=0;
+    for (auto table : {ops::detail::LinearRouteTable::Legacy,ops::detail::LinearRouteTable::Unified}) {
+        ops::detail::force_linear_route_table(table);
+        for (int tokens : {33,65,129,1025}) {
+            const std::size_t words=static_cast<std::size_t>(n)*tokens;
+            GuardedDeviceBuffer dx(static_cast<std::size_t>(k)*tokens*2),dy(words*2);
+            Tensor x(dx.data(),DType::BF16,{k,tokens}),y(dy.data(),DType::BF16,{n,tokens});
+            const auto capacity=ops::linear_add_workspace_capacity_bytes(weight.qtype,n,k,policy,tokens,tokens);
+            if (capacity==0) throw std::runtime_error("FP8 Add affine fixture did not select A8 operands");
+            GuardedDeviceBuffer scratch(std::max<std::size_t>(capacity,256));
+            WorkspaceArena workspace(DeviceSpan{scratch.data(),scratch.bytes()});
+            const auto invoke=[&] { ops::linear_add(x,weight,y,policy,workspace,stream); };
+            CUDA_CHECK(cudaStreamBeginCapture(stream,cudaStreamCaptureModeGlobal));
+            invoke();
+            cudaGraph_t graph=nullptr;
+            cudaGraphExec_t executable=nullptr;
+            CUDA_CHECK(cudaStreamEndCapture(stream,&graph));
+            CUDA_CHECK(cudaGraphInstantiate(&executable,graph,nullptr,nullptr,0));
+            for (int revision=0;revision<3;++revision) {
+                std::vector<std::uint16_t> input(static_cast<std::size_t>(k)*tokens),initial(words);
+                for (int token=0;token<tokens;++token) {
+                    const int kind=(token+revision)%6;
+                    for (int col=0;col<k;++col) {
+                        const float offset=static_cast<float>((col+3*token+revision)%5-2)*0.25F;
+                        const float center=2.0F+0.25F*revision;
+                        const float value=kind==0 ? 0.0F : kind==1 ? 0.5F*(revision+1) :
+                            kind==2 ? -0.5F*(revision+1) : kind==3 ? center+offset :
+                            kind==4 ? -center+offset : offset;
+                        input[static_cast<std::size_t>(token)*k+col]=f32_to_bf16(value);
+                    }
+                    for (int row=0;row<n;++row)
+                        initial[static_cast<std::size_t>(token)*n+row]=
+                            f32_to_bf16(static_cast<float>((row+token+revision)%3-1)/64.0F);
+                }
+                dx.copy_from_host(input.data(),input.size()*2);
+                dy.copy_from_host(initial.data(),words*2);
+                CUDA_CHECK(cudaGraphLaunch(executable,stream));
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                std::vector<std::uint16_t> captured(words),eager(words);
+                dy.copy_to_host(captured.data(),words*2);
+                dy.copy_from_host(initial.data(),words*2);
+                invoke();
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                dy.copy_to_host(eager.data(),words*2);
+                const std::string label="FP8 Add affine centers K="+std::to_string(k)+
+                    " T="+std::to_string(tokens)+" replay="+std::to_string(revision)+
+                    (table==ops::detail::LinearRouteTable::Legacy ? " legacy" : " unified");
+                if (captured!=eager) { std::cerr<<label<<": eager/graph mismatch\n";++failures; }
+                std::vector<double> actual,expected;
+                for (int row : sampled_indices(n)) for (int token=0;token<tokens;++token) {
+                    double sum=0;
+                    for (int col : columns)
+                        sum+=quantized_weight::logical_weight_fp64(packed,row,col)*
+                            bf16_to_f32(input[static_cast<std::size_t>(token)*k+col]);
+                    const std::size_t index=static_cast<std::size_t>(token)*n+row;
+                    actual.push_back(bf16_to_f32(captured[index]));
+                    expected.push_back(sum+bf16_to_f32(initial[index]));
+                }
+                failures+=verify_reduction(label,actual,expected,kA8Tolerance);
+                failures+=dx.verify_guards(label+" input");
+                failures+=dy.verify_guards(label+" output");
+                failures+=scratch.verify_guards(label);
+                if (workspace.used()!=0 || workspace.peak_used()>capacity) {
+                    std::cerr<<label<<": workspace lifetime/capacity mismatch\n";++failures;
+                }
+            }
+            CUDA_CHECK(cudaGraphExecDestroy(executable));
+            CUDA_CHECK(cudaGraphDestroy(graph));
+        }
+        ops::detail::force_linear_route_table(std::nullopt);
+    }
+    failures+=weights.verify_guards("FP8 Add affine weights");
+    failures+=verify_preserved(weights,packed.payload,"FP8 Add affine weights");
+    CUDA_CHECK(cudaStreamDestroy(stream));
     return failures;
 }
 
@@ -345,6 +458,8 @@ int main(int argc, char** argv) {
     if (!wide_only) {
         failures += run_shape(5120, 6144, 17, 877U, false, true);
         failures += run_shape(5120, 17408, 20, 881U, false, true);
+        failures += check_affine_center_replay(6144);
+        failures += check_affine_center_replay(17408);
     }
     std::cout << (failures == 0 ? "OK" : "FAIL") << " FP8 linear_add\n";
     return failures == 0 ? 0 : 1;

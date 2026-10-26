@@ -232,14 +232,14 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
                 const int token0 = token_begin + wn * WN + ni * 8 + 2 * lid;
                 const auto& v    = accumulators[mi][ni];
                 if (FullTokens || token0 < tokens) {
-                    destination.store(row0, token0, epilogue.apply(row0, token0, v[0] * scale0));
-                    destination.store(row1, token0, epilogue.apply(row1, token0, v[2] * scale1));
+                    destination.store(row0, token0, epilogue.apply_scaled(row0, token0, v[0], scale0));
+                    destination.store(row1, token0, epilogue.apply_scaled(row1, token0, v[2], scale1));
                 }
                 if (FullTokens || token0 + 1 < tokens) {
                     destination.store(row0, token0 + 1,
-                                      epilogue.apply(row0, token0 + 1, v[1] * scale0));
+                                      epilogue.apply_scaled(row0, token0 + 1, v[1], scale0));
                     destination.store(row1, token0 + 1,
-                                      epilogue.apply(row1, token0 + 1, v[3] * scale1));
+                                      epilogue.apply_scaled(row1, token0 + 1, v[3], scale1));
                 }
             }
         }

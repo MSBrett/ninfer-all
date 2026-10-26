@@ -1,6 +1,7 @@
 #include "ops/linear/common/route_table.h"
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan_unified.h"
 #include "core/weight.h"
+#include "ops/linear/nvfp4/nvfp4_a8_plan.h"
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
 
 #include "core/layout.h"
@@ -19,6 +20,7 @@ namespace {
 enum class Nvfp4LinearSwiGluRoute {
     DecodeFusedA16,
     SmallTFusedA16,
+    FullTFusedA16,
     FusedW4A4,
     LinearW4A4Post,
     TmaFusedW4A4,
@@ -44,16 +46,10 @@ Nvfp4LinearSwiGluRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (!valid_linear_policy(policy)) {
         throw std::invalid_argument("nvfp4 linear_swiglu: invalid compute policy");
     }
-    if (!allows_a4(policy)) { // A16Only, AllowA8 and the integer-A8 policies
+    if (!allows_a4(policy)) { // A8 is selected before this legacy route resolver.
         if (tokens == 1) { return Nvfp4LinearSwiGluRoute::DecodeFusedA16; }
         if (tokens <= 16) { return Nvfp4LinearSwiGluRoute::SmallTFusedA16; }
-        // Deliberately verbose. This throw fires during *runtime planning*, before a token
-        // is processed, so on sm_86 it is the entire user-visible symptom of an artifact
-        // that cannot be loaded at all -- and "registered only through T=16" gives an
-        // operator nothing to act on. It took a full-suite run and a bisect of two
-        // deliberate decisions to work out why; the message now carries that.
-        throw std::invalid_argument(
-            "nvfp4 linear_swiglu: the A16 route is registered only through T=16, and on sm_80/86/89 A16 is the only policy available for NVFP4 weights (no NVFP4 tensor-core path), so this artifact cannot serve a prefill chunk wider than 16 columns on this architecture. Use a groupwise-int artifact here; an sm_120a build runs NVFP4 through AllowA4 at any width.");
+        return Nvfp4LinearSwiGluRoute::FullTFusedA16;
     }
     if (tokens == 1) { return Nvfp4LinearSwiGluRoute::DecodeFusedA16; }
     if (tokens <= 4) { return Nvfp4LinearSwiGluRoute::SmallTFusedA16; }
@@ -144,6 +140,12 @@ static std::size_t nvfp4_linear_swiglu_workspace_capacity_bytes_own(LinearPolicy
 std::size_t nvfp4_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy,
                                                          std::int32_t min_tokens,
                                                          std::int32_t max_tokens) {
+    if (min_tokens <= 0 || max_tokens < min_tokens || !valid_linear_policy(policy))
+        throw std::invalid_argument("nvfp4 linear_swiglu workspace: invalid interval/policy");
+    if (allows_a8(policy) && current_device_ada_fp8())
+        return nvfp4_ada_a8_capacity(policy,Nvfp4AdaOp::SwiGlu,34816,5120,min_tokens,max_tokens);
+    if (!allows_a4(policy)) return 0;
+
     return capacity_by_table(
         min_tokens, max_tokens,
         [](std::int32_t width) { return fused_route_table("unified/nvfp4_linear_swiglu", width); },
@@ -158,6 +160,18 @@ std::size_t nvfp4_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy,
 void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor& out,
                                   LinearPolicy policy, WorkspaceArena& workspace,
                                   cudaStream_t stream) {
+    if (x.ne[1] <= 0 || !valid_linear_policy(policy))
+        throw std::invalid_argument("nvfp4 linear_swiglu: invalid T/policy");
+    if (nvfp4_uses_ada_a8(policy,Nvfp4AdaOp::SwiGlu,weight.n,weight.k,x.ne[1])) {
+        nvfp4_a8_swiglu_launch(x,weight,out,workspace,stream);
+        return;
+    }
+    policy = nvfp4_ada_fallback_policy(policy);
+    if (!allows_a4(policy) && (x.ne[1] > 16 || weight.weight_divisor_rows < weight.n)) {
+        nvfp4_a16_swiglu_full_launch(x,weight,out,stream);
+        return;
+    }
+
     if (fused_route_table("unified/nvfp4_linear_swiglu", x.ne[1]) == LinearRouteTable::Unified) {
         unified::nvfp4_linear_swiglu_dispatch(x, weight, out, unified_policy(policy), workspace,
                                               stream);
@@ -169,6 +183,9 @@ void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor&
         return;
     case Nvfp4LinearSwiGluRoute::SmallTFusedA16:
         nvfp4_linear_swiglu_small_t_launch(x, weight, out, stream);
+        return;
+    case Nvfp4LinearSwiGluRoute::FullTFusedA16:
+        nvfp4_a16_swiglu_full_launch(x,weight,out,stream);
         return;
     case Nvfp4LinearSwiGluRoute::FusedW4A4:
         nvfp4_linear_swiglu_w4a4_launch(x, weight, out, workspace, stream);

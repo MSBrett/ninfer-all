@@ -241,7 +241,8 @@ void validate_profile(const Profile& profile) {
         throw std::invalid_argument("linear_swiglu test: profile is not registered");
     }
     if ((nvfp4 && profile.activation_compute != ActivationCompute::A16 &&
-         profile.activation_compute != ActivationCompute::A4) ||
+         profile.activation_compute != ActivationCompute::A4 &&
+         profile.activation_compute != ActivationCompute::A8) ||
         (fp8 && profile.activation_compute != ActivationCompute::A16 &&
          profile.activation_compute != ActivationCompute::A8) ||
         (!nvfp4 && !fp8 && profile.activation_compute != ActivationCompute::A16 &&
@@ -279,6 +280,17 @@ int run_profile(std::string_view label, const Profile& profile,
     }
     quantized_weight::PackedWeight host_weight = quantized_weight::make_patterned_weight(
         profile.qtype, profile.gate_up_rows, profile.input_rows, profile.seed, weight_options);
+    if (profile.split_nvfp4_divisors) {
+        if (profile.qtype != QType::NVFP4) {
+            throw std::invalid_argument("split divisors require NVFP4 weights");
+        }
+        const float up_divisor = 0.375F;
+        host_weight.payload.resize(host_weight.weight_divisor_offset + 2 * sizeof(float));
+        std::memcpy(host_weight.payload.data() + host_weight.weight_divisor_offset + sizeof(float),
+                    &up_divisor, sizeof(up_divisor));
+        host_weight.weight.payload_bytes = host_weight.payload.size();
+        host_weight.weight.weight_divisor_rows = profile.output_rows;
+    }
     const std::vector<std::uint16_t> host_activation = make_activation(profile, maximum_tokens);
     const std::vector<double> reference =
         linear_swiglu_oracle_fp64(profile, host_weight, host_activation, maximum_tokens);
@@ -369,7 +381,7 @@ int run_profile(std::string_view label, const Profile& profile,
             }
             if (replay) any_graph_replay_ran = true;
         } catch (const std::exception& error) {
-            if (unsupported_arch_refusal(error)) {
+            if (!profile.require_supported && unsupported_arch_refusal(error)) {
                 std::cout << "SKIP " << label_case << ": " << error.what() << '\n';
                 return;
             }

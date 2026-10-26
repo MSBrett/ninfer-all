@@ -28,6 +28,8 @@ struct Profile {
     std::int32_t output_rows;
     std::uint32_t seed;
     ActivationCompute activation_compute;
+    bool split_nvfp4_divisors = false;
+    bool require_supported = false;
 };
 
 // A program checks this first and skips (exit 77) without a device: run_profile returns a count

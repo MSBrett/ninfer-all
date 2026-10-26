@@ -1,3 +1,10 @@
+# Kept standalone for the local before/after MTP qualification workflow.
+ninfer_add_test(ninfer_qwen3_5_mtp_ffn_test
+  STANDALONE
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_mtp_ffn.cpp"
+  LIBRARIES ninfer_model_runtime)
+ninfer_op_oracle_options(ninfer_qwen3_5_mtp_ffn_test)
+
 ninfer_add_test(ninfer_ngram_proposer_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ngram_proposer.cpp")
 

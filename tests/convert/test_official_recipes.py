@@ -12,6 +12,7 @@ from tools.convert.official_recipes import (
     RECIPES,
     qwen3_8_27b,
     qwen3_8_27b_imatrix,
+    qwen3_8_27b_nvfp4,
     qwen3_8_27b_nvfp4_nvidia,
     qwen3_8_27b_q6,
 )
@@ -233,17 +234,17 @@ def _nvidia_model() -> Model:
     return model
 
 
-def test_nvidia_recipe_stores_the_head_as_fp8() -> None:
-    """The runtime's nvfp4 linear op has no vocabulary-shape kernel, so the
-    source's NVFP4 head must be dequantised and re-quantised to FP8."""
+def test_nvidia_recipe_preserves_the_nvfp4_head() -> None:
+    """The vocabulary projection imports source codes and scales without requantization."""
     model = _nvidia_model()
     recipe = Recipe(model)
     qwen3_8_27b_nvfp4_nvidia(model, recipe, {"quantized": object()})
 
     head = recipe.selections["text/output_head"]
     assert len(head) == 1
-    assert head[0].format == "fp8_e4m3fn_row_bf16"
-    assert head[0].method is fp8_row_maxabs
+    assert head[0].format == "nvfp4"
+    assert head[0].method is import_encoded
+    assert recipe.policies[("text/output_head", "input")] == "AllowA4"
 
     assert _single(_selection_formats(recipe), f"{LAYER}/mlp/gate") == "nvfp4"
     assert _single(_selection_formats(recipe), f"{LAYER}/mlp/down") == "nvfp4"
@@ -255,6 +256,31 @@ def test_nvidia_recipe_stores_the_head_as_fp8() -> None:
     assert _single(_selection_formats(recipe), f"{LAYER}/gdn/query") == (
         "fp8_e4m3fn_row_bf16"
     )
+
+
+def test_unsloth_recipe_keeps_the_mixed_format_boundary_and_q8_mtp() -> None:
+    model = _nvidia_model()
+    for layer in (55, 56, 63):
+        for role in ("gate", "up", "down"):
+            name = f"text/layers/{layer}/mlp/{role}"
+            source = array_source(torch.ones((4, 8), dtype=torch.bfloat16), name)
+            model.add(Parameter(name, (4, 8), source,
+                                source_factory=lambda store, fmt, source=source: source,
+                                inputs=("input",)))
+    name = "mtp/layers/0/mlp/gate"
+    model.add(Parameter(name, (4, 8), array_source(torch.ones((4, 8)), name),
+                        inputs=("input",)))
+    recipe = Recipe(model)
+    qwen3_8_27b_nvfp4(model, recipe, {"quantized": object()})
+    for layer in (55, 56, 63):
+        for role in ("gate", "up", "down"):
+            name = f"text/layers/{layer}/mlp/{role}"
+            selection, = recipe.selections[name]
+            assert selection.format == ("nvfp4" if layer == 55 else "fp8_e4m3fn_row_bf16")
+            assert selection.method is import_encoded
+    assert recipe.selections["text/output_head"][0].format == "fp8_e4m3fn_row_bf16"
+    assert recipe.selections["mtp/layers/0/mlp/gate"][0].format == Q8
+    assert recipe.policies[("mtp/layers/0/mlp/gate", "input")] == "A16Only"
 
 
 def _selection_formats(recipe: Recipe) -> dict[str, set[str]]:

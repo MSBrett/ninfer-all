@@ -23,7 +23,7 @@ enum class LinearPolicy : std::uint8_t {
     AllowA8, ///< Admit either A16 or A8 compute profiles.
     AllowA4, ///< Admit A16, A8 or A4 compute profiles.
     /// Admit either A16 or integer-A8 compute profiles. Distinct from AllowA8, which selects the
-    /// FP8 activation path against FP8 weights; this one quantises activations to s8 with one
+    /// FP8 activation path against FP8 or NVFP4 weights; this one quantises activations to s8 with one
     /// scale per weight group and feeds groupwise-int weights to the integer tensor cores. Held
     /// to the same A8 activation allowance.
     AllowA8Int,
@@ -117,8 +117,8 @@ inline constexpr std::int32_t kCublasPrefillFloorTokens = 128;
  * registered contiguous BF16 problems. Each format owns a finite registry of exact physical
  * weight problems and selects its kernel internally; a valid encoding and alignment do not imply
  * arbitrary N/K support. FP8 currently registers `[N,K]` in `{[14336,5120], [16384,5120],
- * [34816,5120], [248320,5120], [5120,6144], [5120,17408]}` at every positive T. The current NVFP4
- * problems register the five non-vocabulary FP8 geometries and accept every positive T. Q8 also
+ * [34816,5120], [131072,5120], [248320,5120], [5120,6144], [5120,17408]}` at every positive T.
+ * NVFP4 registers the same geometries, including full and proposal vocabulary heads. Q8 also
  * registers `[5120,25600]` at every positive T. BF16 registers `[14336,5120]`,
  * `[5120,6144]`, and `[256,5120]` at every positive T; any other BF16 `[N,K]` (the Gemma 4 vision
  * tower's projections, for instance), and every BF16 problem with an FP32 `out`, runs a
@@ -143,11 +143,14 @@ inline constexpr std::int32_t kCublasPrefillFloorTokens = 128;
  * corresponding low-precision route: the resolved plan may remain A16 when that is the qualified
  * choice. Every policy permits the existing A16 implementations of BF16 and Q4/Q5/Q6/Q8.
  * FP8 accepts all three policies; AllowA8 and AllowA4 permit the private resolver to select a
- * qualified A16 or A8 route for the registered problem and T. FP8 `[248320,5120]` retains A16
- * compute under every policy at every positive T. NVFP4 uses A16 for A16Only and
- * AllowA8; AllowA4 permits the private resolver to select either a qualified A16 route or
- * activation quantization to NVFP4 at every positive T. The selected route depends only on the
- * registered problem and T.
+ * qualified A16 or A8 route for the registered problem and T. FP8 vocabulary heads retain A16
+ * compute under every policy at every positive T. NVFP4 uses A16 for A16Only; AllowA8 also
+ * permits FP8 activation compute on Ada. AllowA4 admits that A8 path on Ada and native A4
+ * activation compute where supported. A8 keeps persistent NVFP4 weights packed: E2M1 codes
+ * convert exactly to E4M3, each G16 dot product accumulates in FP32, and its stored E4M3 scale
+ * is applied before accumulation across groups. The FP32 global divisor is applied after the
+ * reduction. This introduces activation quantization, not a second weight quantization.
+ * The selected route depends on the device capabilities, registered problem and T.
  *
  * @par Workspace
  * `workspace` is caller-owned call-scoped transient storage sized by

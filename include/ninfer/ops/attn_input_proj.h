@@ -125,6 +125,45 @@ void attn_input_proj_fused_rmsnorm_nvfp4(const Tensor& residual, const Tensor& n
                                          WorkspaceArena& workspace, cudaStream_t stream);
 
 /**
+ * True when the native Ada FP8 single-parent attention route can consume fused RMSNorm output.
+ * The predicate follows the selected A8 route and policy; it does not validate weight payloads.
+ */
+[[nodiscard]] bool attn_input_proj_fused_rmsnorm_fp8_eligible(const Weight& weight,
+                                                            LinearPolicy policy,
+                                                            std::int32_t tokens);
+
+/**
+ * Offset RMSNorm, optional residual addition, and row-scaled FP8 Q/K/gate/V projection.
+ * input is contiguous BF16 [5120,T], norm_weight is BF16 [5120], and the parent is
+ * FP8_E4M3FN_ROW_BF16 RowScale [14336,5120]. q/gate are BF16 [6144,T], k/v [1024,T].
+ * All tensors are 16-byte aligned. The selected native Ada A8 route must be eligible above.
+ *
+ * With residual, first compute sum = RN_BF16(input + residual); otherwise sum = input.
+ * Normalize sum using rmsnorm(sum, norm_weight, eps, true), retaining its BF16 output rounding.
+ * The projection consumes exactly the same FP8 codes, row scales, and affine centers as the
+ * ordinary attention projection of that normalized BF16 tensor. Fusion does not change the
+ * normalization reduction or the activation quantization/scaling rule.
+ *
+ * residual is optional contiguous BF16 [5120,T]. residual_sum, when provided, requires residual
+ * and receives sum in a separate BF16 [5120,T] output. Read-only inputs may alias each other;
+ * every output must be disjoint from other outputs, input tensors, weights and live scratch.
+ * eps is positive and finite. No normalized BF16 tensor is materialized and no state is retained.
+ * The caller supplies the same scratch capacity returned by attn_input_proj_workspace_capacity_bytes
+ * for the ordinary parent, policy and T. Allocations preceding this call in the same arena may
+ * contain its inputs/outputs; they must not overlap the scratch allocated by this call.
+ *
+ * Qualification uses the independent FP64 composition with the declared BF16 cast boundaries
+ * and the A8 projection criterion, plus exact comparison with the staged implementation to
+ * protect the promised rounding and scaling equivalence.
+ */
+void attn_input_proj_fused_rmsnorm_fp8(const Tensor& input, const Tensor& norm_weight, float eps,
+                                      const Weight& projection_weight, Tensor& q, Tensor& gate,
+                                      Tensor& k, Tensor& v, LinearPolicy policy,
+                                      WorkspaceArena& workspace, cudaStream_t stream,
+                                      const Tensor* residual = nullptr,
+                                      Tensor* residual_sum = nullptr);
+
+/**
  * Applies the A16-only single-parent Q/K/output-gate/V projection without transient workspace.
  */
 void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight, Tensor& q,

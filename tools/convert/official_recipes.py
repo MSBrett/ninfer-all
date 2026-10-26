@@ -274,6 +274,41 @@ def qwen3_6_27b_nvfp4(model, recipe, sources):
         )
 
 
+def _preserve_nvfp4_mlp_pairs(model, recipe):
+    """Keep gate/up in one executable parent without merging source calibration."""
+    for gate in model.parameters:
+        if not gate.startswith("text/layers/") or not gate.endswith("/mlp/gate"):
+            continue
+        up = gate.removesuffix("gate") + "up"
+        if up not in model.parameters:
+            continue
+        first, second = recipe.selections[gate], recipe.selections[up]
+        if len(first) != 1 or len(second) != 1:
+            continue
+        if any(selection.format != "nvfp4" for selection in (first[0], second[0])):
+            continue
+        # A fused native SwiGLU takes one complete parent. Explicit grouping
+        # retains a separate weight divisor for each source when they differ.
+        recipe.group((gate, up))
+        sources = (first[0].source, second[0].source)
+        words = [
+            [getattr(source, role)() if getattr(source, role) else None for source in sources]
+            for role in ("weight_divisor", "input_divisor")
+        ]
+        # A4 shares one activation calibration and one scalar weight divisor.
+        # A8 uses dynamic activation scales and supports each row's weight
+        # divisor; A16 remains permitted by the same policy on other devices.
+        policy = ("AllowA8" if any(None not in pair and pair[0] != pair[1] for pair in words)
+                  else "AllowA4")
+        for index, name in enumerate((gate, up)):
+            for input_name in model.parameters[name].inputs:
+                recipe.use(
+                    name, input_name, activation_policy=policy,
+                    auxiliaries=({"activation_input_divisor": words[1][index]}
+                                 if words[1][index] is not None else None),
+                )
+
+
 def qwen3_8_27b_nvfp4(model, recipe, sources):
     if "num_experts" in model.config:
         raise ValueError("this official recipe requires Qwen3.5 Dense mathematics")
@@ -299,12 +334,14 @@ def qwen3_8_27b_nvfp4(model, recipe, sources):
             activation_policy="AllowA4" if format == "nvfp4" else "AllowA8",
         )
 
+    _preserve_nvfp4_mlp_pairs(model, recipe)
+
 
 def qwen3_8_27b_nvfp4_nvidia(model, recipe, sources):
     """nvidia/Qwen3.8-27B-NVFP4 (ModelOpt AutoQuant) layout: every text MLP
-    projection is NVFP4; attention and GDN projections are per-row FP8. The
-    source output head is NVFP4, but the runtime registers the vocabulary
-    projection only for FP8, so it is dequantised and re-quantised there."""
+    projection and the output head are imported NVFP4; attention and GDN
+    projections are per-row FP8. Source codes, block scales and the source
+    global-scale semantics are retained through the encoded importer."""
     if "num_experts" in model.config:
         raise ValueError("this official recipe requires Qwen3.5 Dense mathematics")
     _optional(model, recipe)
@@ -319,18 +356,9 @@ def qwen3_8_27b_nvfp4_nvidia(model, recipe, sources):
         ):
             recipe.assign(name, source=source)
             continue
-        if name == "text/output_head":
-            recipe.assign(
-                name,
-                format=FP8,
-                method=fp8_row_maxabs,
-                source=source,
-                activation_policy="AllowA8",
-            )
-            continue
         format = (
             "nvfp4"
-            if name.startswith("text/layers/") and "/mlp/" in name
+            if name == "text/output_head" or "/mlp/" in name
             else FP8
         )
         recipe.assign(
@@ -340,6 +368,8 @@ def qwen3_8_27b_nvfp4_nvidia(model, recipe, sources):
             source=model.source(name, quantized, format),
             activation_policy="AllowA4" if format == "nvfp4" else "AllowA8",
         )
+
+    _preserve_nvfp4_mlp_pairs(model, recipe)
 
 
 def qwen3_8_27b_nvfp4_orcarouter(model, recipe, sources):

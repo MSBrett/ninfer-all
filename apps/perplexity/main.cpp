@@ -81,6 +81,7 @@ struct Options {
     float rope_scaling_factor                   = 1.0F;
     std::uint32_t rope_scaling_original_context = 0;
     bool mlp_a8_decode                  = false;
+    bool no_fp8_compute                 = false;
     bool prefill_a8                     = true;
     bool prefill_cublas                 = false;
     bool prefill_cublas_projections     = true;
@@ -104,7 +105,8 @@ std::string usage_text() {
            "<directory>]\n"
            "       [--lm-head-q4|--lm-head-q6] [--embedding-q4|--embedding-q6] [--mtp-experts-q4] "
            "[--gdn-state-fp16]\n"
-           "       [--mlp-a8-decode] [--no-prefill-a8] [--rope-yarn] [--rope-yarn-factor F]\n"
+           "       [--mlp-a8-decode] [--no-prefill-a8] [--no-fp8-compute]\n"
+           "       [--rope-yarn] [--rope-yarn-factor F]\n"
            "       [--rope-scaling-factor F [--rope-scaling-original-context N]]\n"
            "       (--mlp-a8-decode is inert here: the route it enables is verify-phase"
            "        only, and scoring runs the prefill phase)\n"
@@ -248,6 +250,8 @@ Options parse_options(int argc, char** argv) {
                     value("--rope-scaling-original-context"));
         } else if (option == "--mlp-a8-decode") {
             out.mlp_a8_decode = true;
+        } else if (option == "--no-fp8-compute") {
+            out.no_fp8_compute = true;
         } else if (option == "--no-prefill-a8") {
             out.prefill_a8 = false;
         } else if (option == "--prefill-cublas") {
@@ -388,6 +392,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     engine_options.rope_scaling_factor           = options.rope_scaling_factor;
     engine_options.rope_scaling_original_context = options.rope_scaling_original_context;
     engine_options.mlp_a8_decode    = options.mlp_a8_decode;
+    engine_options.no_fp8_compute   = options.no_fp8_compute;
     engine_options.prefill_a8       = options.prefill_a8;
     engine_options.prefill_cublas   = options.prefill_cublas;
     engine_options.prefill_cublas_projections = options.prefill_cublas_projections;
@@ -574,6 +579,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
           {"rope_scaling_factor", options.rope_scaling_factor},
           {"rope_scaling_original_context", options.rope_scaling_original_context},
           {"fast_prefill_kernel", options.fast_prefill_kernel},
+          {"no_fp8_compute", options.no_fp8_compute},
           {"stride_tokens", options.disjoint ? options.context : options.stride},
           {"windows", options.disjoint ? "disjoint" : "sliding"},
           {"prefill_chunk_tokens", 1024},

@@ -14,6 +14,7 @@ using Bulk    = Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<128, 256, 128, 2, 4, 
 } // namespace
 
 std::size_t fp8_gdn_input_partial_capacity_bytes(std::int32_t max_tokens) {
+    if (current_device_ada_fp8()) return 0;
     return max_tokens > 256 ? Bulk::kPartialBytes : 0;
 }
 
@@ -32,6 +33,10 @@ void fp8_gdn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& qkv,
         else
             launch_fp8_a8_mma<S>(operands, output, LinearIdentityEpilogue{}, stream);
     };
+    if (current_device_ada_fp8()) {
+        if (x.ne[1] <= 32) return launch.template operator()<Fp8A8T32R32K128>();
+        return launch.template operator()<Fp8A8T64R128K128>();
+    }
     if (x.ne[1] <= 32) return launch.template operator()<Fp8A8T32R32K128>();
     if (x.ne[1] <= 64) return launch.template operator()<Fp8A8T64R128K256>();
     if (x.ne[1] <= 128) return launch.template operator()<Tma64x128>();

@@ -1,20 +1,27 @@
-# KISS proposal: native MTP and useful RT offloads on the RTX 4090
+# KISS proposal: put the RTX 4090 RT cores to work in NInfer
 
 Status: revised proposal; no new kernel implementation or measured speedup.
 Updated: 2026-10-25. Target: Windows, RTX 4090, Qwen3.8-27B, text-only coding agent.
 
 ## Decision
 
-**Use Qwen's native MTP, preserve its full vocabulary and verification, and use idle RT
-hardware for useful work wherever published implementations provide a relevant starting point.**
+**Find one real mathematical operation in NInfer that the RTX 4090's RT hardware can
+perform, implement the offload, and demonstrate that its result contributes to inference.**
 
-The owner accepts a small useful offload anywhere in inference, including selection, indexing
-or data access. A complete MTP matrix multiplication on RT cores is not required.
-The earlier exclusion of geometric mappings was too broad and is withdrawn. The earlier
-approximate vocabulary shortlist remains outside the selected baseline.
+The owner wants useful work on silicon that is otherwise idle. The search covers the text
+inference path: layer arithmetic, reductions, comparisons, sampling, speculative decoding and
+state/KV bookkeeping. MTP argmax is one candidate, not the objective or a required first choice.
+A complete matrix multiplication on RT cores is not required. Geometric reformulations are
+explicitly in scope when their outputs implement the selected mathematical operation.
 
+First establish **feasibility and actual hardware attribution**. Then measure cost, overlap
+and performance. A correct RT offload can establish feasibility even if its first implementation
+is small or slower overall; report that result honestly rather than rejecting the experiment
+before it exists. Faster complete inference is a later adoption criterion, not a prerequisite
+for answering whether any real math can be offloaded.
+
+A busy loop, discarded result, or CUDA shader doing all the arithmetic does not meet this goal.
 The [original RT proposal](RT_PROPOSER_PROPOSAL.md) remains supporting research.
-This file is the focused proposal; the table below records prior art, not NInfer speedup claims.
 
 ## Published implementations to study
 
@@ -42,30 +49,31 @@ remain part of each implementation's cost. Preserve KV capacity when evaluating 
 
 ## Configuration and goal
 
-| Setting | Choice |
+| Setting | Current working reference |
 |---|---|
 | Model | Qwen3.8-27B with its native MTP component |
 | GPU | RTX 4090, native `sm_89` build |
-| Toolchain | Installed CUDA Toolkit 13.4.3; NVCC reports 13.4.92 |
+| Toolchain | CUDA Toolkit 13.4.3; NVCC 13.4.92; server built successfully |
 | Input | Text only; Vision disabled |
 | Target KV | `rk8v4` |
 | Active requests | One |
-| Baseline | `--spec mtp --full-draft-head`, initially three draft tokens |
-| Context | Maximum demonstrated usable capacity; initially target **160,000–200,000 tokens** |
-| API | Port `8899` |
+| Deployment baseline | MTP4 with the artifact's existing optimized proposal head |
+| Context/KV capacity | 239,872 tokens; startup/memory fit verified, long-context execution unqualified |
+| Output | 65,536 default; clients may request 131,072 when the remaining context permits |
+| Thinking | `xhigh`, preserved reasoning; Qwen thinking-mode sampling |
+| API / monitor | Ports `8899` / `8898` |
 
-The separate three-mode experiment uses 100,000 tokens. This document does not alter that work.
-The deployment goal remains maximum useful context. The 160–200K range is a hypothesis;
-increase further if the complete configuration fits and executes correctly. The documented
-native window is 262,144 tokens; extending beyond it is a separate decision.
+The deployment reached 97.0% physical VRAM usage with the Windows evictable-memory budget.
+An RT experiment must account for its extra allocations and any KV-capacity tradeoff; do not
+silently shrink context or present a changed configuration as a performance improvement.
+The local MTP4 speed reference, about 184.8 tokens/s, was measured separately with 32K input,
+100K allocated context, greedy sampling, thinking off and the optimized proposal head. It is
+not a measured speed for the new thinking configuration or a full-head RT baseline.
 
-Context includes input and generated output. Reserve an explicit output allowance.
-MTP weights and state, workspace, CUDA Graphs and desktop usage count against the same memory.
-Host prefix caching helps reuse, but does not enlarge active GPU context.
-
-The local `cuda134-sm89` CMake configuration selects Release, architecture 89 and the installed
-13.4.3 toolkit. Installation/configuration alone does not establish a completed build or
-qualified performance.
+Context includes input, reasoning and generated answer. Host prefix caching helps reuse,
+but does not enlarge active GPU context. Keep model/head, KV representation, draft count and
+sampling fixed for each off/on comparison. Full-head selection is a separate explicit axis
+when an experiment needs it, not a prerequisite for investigating every other math operation.
 
 ## The head flags
 
@@ -76,24 +84,24 @@ rows are copied into an additional matrix, normally 131,072 rows.
 | Option | Behavior |
 |---|---|
 | `--lm-head-draft` | Require the artifact's optimized proposal matrix; fail if unavailable. |
-| `--full-draft-head` | Use the target model's full output matrix for MTP proposals; our baseline. |
+| `--full-draft-head` | Use the target model's full output matrix for MTP proposals; an explicit experimental variant. |
 | Neither | Automatically prefer the optimized proposal matrix when stored in the artifact. |
 
 All choices still require `--spec mtp` to select native MTP. Target verification retains the
 full vocabulary. Removing `--lm-head-draft` alone does not force the full head.
 
-The inspected local `run-experiment-cuda134.ps1` MTP branch uses `--lm-head-draft`.
-It needs an explicit full-head selection for this proposal's baseline. The launcher has not
-been changed by this document update.
+The local desktop launcher `start-local-mtp4.ps1` uses `--lm-head-draft` and four draft tokens.
+Retain that working configuration as a control. A full-head experiment must select its head
+explicitly and establish its own baseline; the earlier measured throughput does not transfer.
 
-## Existing code to optimize
+## Existing inference code to inspect
 
 ```text
 Native MTP input preparation
           |
 Existing MTP neural layer and KV attention
           |
-Full vocabulary projection and token selection
+Selected output-head projection and token selection
           |
 Existing target verification and state commit
 ```
@@ -108,14 +116,15 @@ Existing target verification and state commit
 | Token selection | [argmax.cu](src/ops/launcher/argmax.cu) |
 | RTX 4090 route choices | [device_profiles.json](src/runtime/engine/device_profiles.json) |
 
-Start with the actual bottleneck: vocabulary scoring, attention, FFN, dequantization, copies
-or launch overhead. Candidate changes are better CUDA/Tensor Core kernels, tiling, fusion and
-data reuse. Do not assume a new kernel is necessary or that an existing kernel leaves useful
-arithmetic capacity idle.
+This source map is an example entry point, not an MTP-only boundary. Inventory actual mathematical
+operations across the text path and ask whether a built-in RT intersection/traversal result can
+replace some of their existing work. An operation does not have to be the largest bottleneck to
+qualify for this feasibility experiment. Profiling can prioritize candidates and later explain
+the result; it must not turn the question into a different CUDA/Tensor Core optimization project.
 
-Keep the full vocabulary and selected weight/KV representations. No additional frequency
-shortlist, low-rank truncation, activation pruning, sparse target attention or new neural drafter.
-Preserve the current MTP proposal/verification semantics and model state ownership.
+Keep the selected model, proposal head, weight/KV representations and public math semantics.
+No additional vocabulary shortlist, pruning, sparse target attention or new neural drafter is
+introduced merely to make an RT demonstration easier. Preserve existing state ownership.
 
 ## Research disposition
 
@@ -128,87 +137,75 @@ Use the published implementations above to identify an exact offload in the exis
 path. Keep RT research in scope; distinguish the operation already demonstrated by the authors
 from any proposed NInfer adaptation. No adaptation or performance claim is established yet.
 
-## Independent switches and combinations
+## Candidate operations
 
-Every implemented offload gets one independent on/off switch in the development runner.
-All off selects the existing CUDA path. Off must also remove that feature's index, workspace
-and update work, so the baseline does not pay for disabled features. Log the effective settings;
-fail clearly if an enabled feature is unsupported rather than silently running the baseline.
-These are proposed experimental controls, not existing CLI options.
+These are candidates to investigate, not implemented NInfer features. Start with an operation
+that has a real consumer in the current engine and a concrete geometric mapping.
 
-| Control | Initial scope |
-|---|---|
-| RT selection | First prototype: full-vocabulary MTP token selection, with the existing CUDA selector as baseline. |
-| RT overlap | Separate scheduling control, introduced only when there is independent work to overlap; serialized execution remains measurable. |
-| Other offloads | Give each a separate switch when an actual NInfer operation and implementation are selected. Predicate filtering, index lookup and sparse matching remain prior-art leads, not placeholder features. |
+| Mathematical work | RT mapping to investigate | Starting evidence / open question |
+|---|---|---|
+| Minimum/maximum and argmin/argmax reductions | Encode values as geometry; a closest hit identifies an extremum. | RTXRMQ demonstrates the reduction mapping. Choose the simplest real NInfer use, not automatically MTP selection. |
+| Range, threshold and membership comparisons | Encode the numeric domain as indexed geometry; intersections identify qualifying values. | RTScan and RTIndeX are leads. Identify an actual inference predicate and preserve its exact value domain. |
+| Sparse-coordinate matching or index comparisons | RT traversal finds matching coordinates or keys. | RTSpMSpM supplies a matching example; its multiply/accumulate is shader work. Confirm a relevant consumer before adapting it. |
+| Arithmetic reformulated as geometric intersections | Investigate whether an existing arithmetic expression can be represented by the built-in intersection result. | Open research candidate. Require an explicit derivation and actual RT execution; do not claim generic RT dot products or matrix arithmetic from shader code. |
 
-Feature switches belong to operations, not to paper names. Reuse the existing runner and
-explicit configuration; do not build a generic dispatch framework or implement every paper.
-Keep native MTP, full-head choice, model, KV format, context, draft count and sampling fixed
-while comparing RT combinations. Existing MTP enable/disable is a separate experimental axis.
-
-For the small number of implemented features, compare all off, each alone, relevant pairs and
-all together. Compare serialized and overlapped scheduling for combinations with independent
-work. If only two features exist, measure all four on/off combinations. Do not infer their
-combined benefit by adding isolated speedups. Never overlap a consumer with its unfinished
-producer: the next dependent MTP draft cannot start before its required token is selected.
+Keep the search open to another operation if its mapping is simpler. No candidate is selected
+solely because a profiler says it dominates runtime, and no unsupported arithmetic capability
+is assumed because the silicon is idle.
 
 ## KISS first implementation
 
-The first concrete candidate is an RTXRMQ-style selector at the existing proposal_argmax seam.
-It has a small integration boundary and leaves the neural layer, full head projection, KV and
-verification intact. This is a choice for minimum prototype effort, not a claim that dynamic
-logit selection will beat CUDA or be the largest opportunity.
+1. Select **one** existing mathematical operation and write down its inputs, outputs, exactness
+   requirements, current CUDA/host implementation and the proposed geometric formulation.
+   Prefer a demonstrated mapping such as an extremum or comparison before inventing one.
+2. Build the smallest standalone offload using real values/shapes from that operation and the
+   SDK's smallest applicable example. Inspect licenses before reusing a published implementation.
+   Complete the implementation batch before qualification; no per-edit test campaign.
+3. Show that the RT-produced value matches the operation's independent oracle and is usable
+   at that existing engine boundary. Cover the represented BF16/FP32 or integer semantics,
+   tie-breaking, padding and supported exceptional inputs. State unsupported domains explicitly.
+4. Establish hardware attribution: which work uses built-in RT traversal/intersection and which
+   work remains on SMs. Use supported tooling/counters where available and state their limits.
+   An OptiX launch by itself does not establish that its arithmetic ran on RT units.
+5. Route one actual operation through the offload under one opt-in switch, retaining the current
+   implementation as the off path. Its result must feed the inference computation. Keep fixed
+   allocation and ownership boundaries; disabled experiments must not retain their extra work.
+6. Report the complete cost: encoding, index construction/update, tracing, decoding, launches,
+   synchronization and persistent/temporary memory. A slower first result still answers the
+   feasibility question; it does not establish a deployment improvement.
+7. After the offload works, try overlap with genuinely independent CUDA/Tensor Core work where
+   dependencies permit it. Measure the overlap rather than assuming separate units run for free.
+   Add another operation or scheduling switch only when the first result is understood.
 
-1. Build a small replay prototype using actual full-head MTP logits and token counts, the
-   existing CUDA selector, and one OptiX selection path. Use the SDK's smallest applicable
-   sample and published RTXRMQ mapping as references; inspect reuse licenses before copying.
-   Do not start with server integration, multiple RT offloads or concurrent scheduling.
-2. Include geometry encoding, per-step BVH build/update, tracing, decoding, launches and
-   synchronization in the RT cost. Static-scene trace-only timings cannot answer this question:
-   logits change every draft step. Report persistent and temporary memory separately.
-3. Complete this implementation batch before qualification. Independently establish the winner
-   for the represented logit type; match token IDs, tie-breaking, padding exclusion and the
-   supported handling of non-finite values. An encoding that cannot preserve those semantics
-   is not an exact replacement. No vocabulary shortlist or approximate winner is permitted.
-4. Measure the full selector cost against the existing CUDA selector at actual decode batch
-   sizes, not a large synthetic query batch. Record the baseline selector's share of an MTP
-   round to bound its possible end-to-end payoff. If full cost loses, stop this prototype before
-   adding it to serving. That rejects this offload, not every use of RT cores.
-5. If it wins, add the smallest opt-in integration at proposal_argmax and compare complete MTP
-   rounds and output throughput with the switch off/on. Preserve Model/Program/Op ownership,
-   fixed allocations and state semantics; expose graph/interop costs in the measurement.
-6. Only after that result, select a second concrete offload from the prior art and give it its
-   own switch. Add overlap only where dependencies permit it. Hill-climb one parameter at a
-   time from the best demonstrated configuration: layout, update strategy, batching, then
-   scheduling as applicable. Retain the original baseline for every comparison.
+For changing values such as logits, charge geometry/BVH updates each step unless reuse has
+actually been demonstrated. For static data, report construction separately and its amortization.
+Keep RT research in scope if the first mapping fails; report why that mapping failed and select
+another concrete mathematical operation. Do not replace this feasibility task with a general
+bottleneck hunt or require a predicted end-to-end speedup before attempting any offload.
 
-If the initial timing bound shows selection cannot yield a useful gain, record that result
-and choose another concrete operation before doing a larger selector implementation.
-A useful outcome can be small, but must reduce a measured cost rather than just raise RT usage.
+## Completion and measurement
 
-## Measurement and stopping rule
+The first deliverable is one table:
 
-Keep workload, context, output allowance and all non-feature settings identical across a
-comparison. Include representative code generation, editing and cached tool turns once the
-prototype reaches inference. Use independent arithmetic/exact oracles for changed operations.
-Batch development before qualification; no per-edit test runs or unrelated suite campaigns.
+| Operation | RT work / SM work | Correctness | Useful inference consumer | RT execution evidence | Extra memory | Complete time / CUDA time | Overlap |
+|---|---|---|---|---|---|---|---|
+| One selected operation | To establish | To establish | To identify | To establish | To measure | To measure | Initially serialized |
 
-Record a compact comparison table with enabled features, scheduling, component time, complete
-MTP round time, output tokens/s, acceptance, cold/warm latency, extra VRAM and correctness.
-Repeat enough to distinguish a claimed difference from observed run variation. Include slower
-cases and setup/update costs. Kernel speed alone does not establish an inference improvement.
-RT utilization is diagnostic, not the success criterion.
+Feasibility succeeds when real RT hardware performs part of an existing mathematical operation,
+the result is correct, and that result is consumed by inference. RT activity is part of this
+milestone's evidence. Do not substitute dummy utilization for useful work or claim a measured
+RT-busy percentage when the tools cannot establish it.
 
-Keep context fixed for performance comparisons. Then separately establish maximum usable
-context with the selected configuration and report any capacity lost to RT indices/workspace.
-Do not silently lower context to make an offload fit. The 160–200K goal remains unverified.
+Then evaluate engineering value separately: full-operation and inference latency, throughput,
+SM/Tensor work displaced, concurrent execution, extra VRAM and usable context. Keep settings fixed,
+include setup/update costs and disclose slower cases. Use the existing runner for inference
+comparisons; no generic feature framework or exhaustive combinations before features exist.
 
-Retain only changes with a demonstrated end-to-end benefit and acceptable correctness and
-memory use; keep optional experiments off by default until qualified. Once the first result
-is decisive, report it before expanding the implementation. No installation, compilation or
-GPU execution has been performed for this document update. Move supported behavior/results
-into the existing active references and retire this temporary proposal when the work ends.
+A correct but slower offload is a documented feasibility result and stays experimental/off by
+default. A production default requires a worthwhile measured tradeoff. Do not silently reduce KV
+capacity to manufacture a gain. Stop after reporting the first decisive feasibility result before
+expanding scope. This revision changes the proposal only; it installs nothing, starts no server,
+and runs no compilation, GPU operation or benchmark.
 
 ## Sources
 
@@ -224,4 +221,9 @@ Inspected/reviewed 2026-10-25:
 - [Turing source](https://github.com/intutic/turing/tree/82f039c10981b450faf2abae2e9b60383dca0ec2):
   read-only inspection, no reproduced results or imported code.
 - Local `.serena/cache/cuda134-sm89/CMakeCache.txt`,
-  `.serena/cache/run-experiment-cuda134.ps1`, and installed NVCC version output.
+  `.serena/cache/start-local-mtp4.ps1`, `.serena/cache/local-mtp4.requests.jsonl`,
+  `profiles/bench/spec-32kin-16kout-cuda134/`,
+  `profiles/bench/spec-32kin-16kout-mtp4-cuda134/`, installed NVCC output and the
+  October 25 `nvidia-smi` reading of 23,828 / 24,564 MiB.
+- Owner clarification, October 25: the goal is to find any real math operation that can use
+  idle RT hardware; feasibility comes before deciding whether the first implementation is faster.

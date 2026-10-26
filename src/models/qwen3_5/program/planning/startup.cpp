@@ -474,6 +474,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 if (const auto* attention =
                         std::get_if<execution::AttentionParameters>(&block.mixer)) {
                     (void)workspace::text_attention_projection(layout, config, last);
+                    // Fused FP8 calls omit h at execution. Keep the conservative reservation
+                    // for unfused widths and device/profile choices within this interval.
                     (void)workspace::matrix(layout, DType::BF16, dimension(config.hidden_size),
                                             last);
                     scratch(layout, execution::attention_projection_workspace_bytes(*attention,

@@ -62,6 +62,7 @@ struct Options {
     std::uint32_t rope_scaling_original_context = 0;
     bool wddm_evictable_budget = false;
     bool mlp_a8_decode  = false;
+    bool no_fp8_compute = false;
     bool prefill_a8     = true;
     bool prefill_cublas = false;
     bool prefill_cublas_projections = true;

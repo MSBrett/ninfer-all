@@ -59,7 +59,7 @@ template <class Schedule>
 __device__ __forceinline__ void
 fp8_mma_compute_stage(const std::uint8_t* activation_stage, const std::uint8_t* weight_stage,
                       float (&accumulators)[Schedule::kMmaTokens][Schedule::kMmaRows][4], int warp,
-                      int lane) {
+                      int lane, float (*weight_sums)[4] = nullptr) {
     constexpr int BK        = Schedule::kBlockK;
     const int warp_token    = warp / Schedule::kWarpsRows;
     const int warp_row      = warp % Schedule::kWarpsRows;
@@ -99,6 +99,16 @@ fp8_mma_compute_stage(const std::uint8_t* activation_stage, const std::uint8_t* 
             if (k_step + 1 < Schedule::kMmaK) {
                 load_fragments(k_step + 1, a_fragments[slot ^ 1], b_fragments[slot ^ 1]);
             }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 890
+            if (weight_sums) {
+#pragma unroll
+                for (int row = 0; row < Schedule::kMmaRows; ++row)
+                    mma_fp8_e4m3(weight_sums[row][0], weight_sums[row][1],
+                                 weight_sums[row][2], weight_sums[row][3],
+                                 0x38383838U, 0x38383838U, 0x38383838U, 0x38383838U,
+                                 b_fragments[slot][row][0], b_fragments[slot][row][1]);
+            }
+#endif
 #pragma unroll
             for (int mma_token = 0; mma_token < Schedule::kMmaTokens; ++mma_token) {
 #pragma unroll
@@ -118,6 +128,16 @@ fp8_mma_compute_stage(const std::uint8_t* activation_stage, const std::uint8_t* 
 #pragma unroll
         for (int k_step = 0; k_step < Schedule::kMmaK; ++k_step) {
             load_fragments(k_step, a_fragments, b_fragments);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 890
+            if (weight_sums) {
+#pragma unroll
+                for (int row = 0; row < Schedule::kMmaRows; ++row)
+                    mma_fp8_e4m3(weight_sums[row][0], weight_sums[row][1],
+                                 weight_sums[row][2], weight_sums[row][3],
+                                 0x38383838U, 0x38383838U, 0x38383838U, 0x38383838U,
+                                 b_fragments[row][0], b_fragments[row][1]);
+            }
+#endif
 #pragma unroll
             for (int mma_token = 0; mma_token < Schedule::kMmaTokens; ++mma_token) {
 #pragma unroll
@@ -140,7 +160,8 @@ fp8_finish_mma_tile(Output output, Epilogue epilogue, RowPolicy row_policy,
                     unsigned char* shared_raw,
                     float (&accumulators)[Schedule::kMmaTokens][Schedule::kMmaRows][4],
                     const float* activation_scales, const __nv_bfloat16* weight_scales,
-                    int row_begin, int token_begin, int rows, int tokens, int warp, int lane) {
+                    int row_begin, int token_begin, int rows, int tokens, int warp, int lane,
+                    const float* activation_centers = nullptr, float (*weight_sums)[4] = nullptr) {
     constexpr bool PairRows = RowPolicy::kPaired;
     constexpr int BM = Schedule::kBlockTokens, BN = Schedule::kBlockRows;
     constexpr int producers = [] {
@@ -185,14 +206,22 @@ fp8_finish_mma_tile(Output output, Epilogue epilogue, RowPolicy row_policy,
                 return make_float2(__bfloat162float(weight_scales[parent_row0]),
                                    __bfloat162float(weight_scales[parent_row1]));
             }();
+            const auto activation_value = [&](int element, int token, float scale) {
+                const float scaled = accumulators[mma_token][mma_row][element] * scale;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 890
+                if (weight_sums && token < tokens && activation_centers[token] != 0.0F)
+                    return fmaf(weight_sums[mma_row][element & 1], activation_centers[token], scaled);
+#endif
+                return scaled;
+            };
             float value00 =
-                accumulators[mma_token][mma_row][0] * activation_scale0 * weight_scale.x;
+                activation_value(0, token0, activation_scale0) * weight_scale.x;
             float value01 =
-                accumulators[mma_token][mma_row][1] * activation_scale0 * weight_scale.y;
+                activation_value(1, token0, activation_scale0) * weight_scale.y;
             float value10 =
-                accumulators[mma_token][mma_row][2] * activation_scale1 * weight_scale.x;
+                activation_value(2, token1, activation_scale1) * weight_scale.x;
             float value11 =
-                accumulators[mma_token][mma_row][3] * activation_scale1 * weight_scale.y;
+                activation_value(3, token1, activation_scale1) * weight_scale.y;
             if constexpr (collective) {
                 accumulators[mma_token][mma_row][0] = value00;
                 accumulators[mma_token][mma_row][1] = value01;

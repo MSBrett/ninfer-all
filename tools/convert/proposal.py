@@ -101,6 +101,22 @@ def add_proposal(
     recipe.add_parameter("proposal/token_ids")
     if encoded is not None:
         recipe.assign("proposal/head", format=encoded, method=import_encoded)
+        # Encoded gathered rows retain the same source calibration for each
+        # mathematical input. Their Uses remain independently addressable.
+        for input_name in inputs:
+            recipe.use(
+                "proposal/head", input_name,
+                activation_policy=recipe.policies.get(
+                    ("text/output_head", input_name), "A16Only"
+                ),
+                auxiliaries={
+                    role: value
+                    for (parameter, source_input, role), value
+                    in recipe.auxiliary_overrides.items()
+                    if parameter == "text/output_head" and source_input == input_name
+                    and role == "activation_input_divisor"
+                },
+            )
     else:
         recipe.assign("proposal/head", format=format, method="grouped_absmax")
     if derived:
@@ -127,7 +143,9 @@ def add_official_proposal(
     # ternary checkpoint's head), the base checkpoint's head otherwise.
     base = recipe.model.parameters["text/output_head"].source
     selections = recipe.selections["text/output_head"]
-    if len(selections) == 1 and selections[0].source is not base:
+    if len(selections) == 1 and (
+        selections[0].method is import_encoded or selections[0].source is not base
+    ):
         add_proposal(recipe, ranking=ranking, rows=rows)
         return
     add_proposal(recipe, ranking=ranking, rows=rows, source=base)

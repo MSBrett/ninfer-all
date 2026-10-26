@@ -4,6 +4,7 @@
 #include "ninfer/ops/gdn_input_proj.h"
 
 #include "ops/input_projection_test_common.h"
+#include "ops/linear/common/route_table.h"
 
 #include <cuda_runtime.h>
 
@@ -17,9 +18,8 @@ using namespace ninfer;
 using namespace ninfer::test;
 using namespace ninfer::test::input_projection;
 
-// The A8 workspace contracts describe the parts that run FP8 A8 (its TMA split-K partials are
-// sized there); an sm_8x build never admits A8 and does not carry those schedules.
-#if defined(NINFER_SM8X_COMPAT) && !defined(NINFER_SM120_FP8)
+// Ada uses row-quantized FP8 workspace; Blackwell may also reserve TMA split-K partials.
+#if defined(NINFER_SM8X_COMPAT) && !defined(NINFER_SM120_FP8) && !defined(NINFER_SM89_FP8)
 constexpr bool kA8Executable = false;
 #else
 constexpr bool kA8Executable = true;
@@ -391,13 +391,21 @@ int run_nvfp4() {
 }
 
 int run_fp8_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearPolicy policy,
-                 bool convenience = false, bool replay = false) {
+                 bool convenience = false, bool replay = false, bool affine_input = false) {
     constexpr std::int32_t kHidden  = 5120;
     constexpr std::int32_t kQkvRows = 10240;
     constexpr std::int32_t kZRows   = 6144;
     constexpr std::int32_t kRows    = kQkvRows + kZRows;
     std::vector<float> activation =
         make_bf16_activation(kHidden, tokens, 617U + static_cast<std::uint32_t>(tokens));
+    if (affine_input)
+        for (int token = 0; token < tokens; ++token)
+            for (int col = 0; col < kHidden; ++col) {
+                auto& value = activation[std::size_t(token) * kHidden + col];
+                if (token % 4 == 0) value = 0.0F;
+                if (token % 4 == 1) value = 0.25F;
+                if (token % 4 == 2) value = 0.25F + float(col % 8) * (1.0F / 32.0F);
+            }
     std::vector<std::uint16_t> activation_bits = bf16_bits(activation);
     DeviceBuffer device_activation             = to_device(activation_bits);
     GuardedBf16Tensor qkv(kQkvRows, tokens);
@@ -527,22 +535,41 @@ int run_fp8() {
         failures += run_case_allowing_arch_skip(
             "gdn_input_proj FP8 A8 replay T=" + std::to_string(tokens),
             [&] { return run_fp8_case(parent, tokens, ops::LinearPolicy::AllowA8, false, true); });
+    if (ops::current_device_ada_fp8()) {
+        struct RestoreTable {
+            ~RestoreTable() { ops::detail::force_linear_route_table(std::nullopt); }
+        } restore;
+        for (auto table : {ops::detail::LinearRouteTable::Legacy,
+                           ops::detail::LinearRouteTable::Unified}) {
+            ops::detail::force_linear_route_table(table);
+            for (int t : {17, 33, 64, 65, 129, 257, 1025, 2048})
+                failures += run_fp8_case(
+                    parent, t, ops::LinearPolicy::AllowA8, false, t != 2048, true);
+        }
+    }
     return failures;
 }
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    const bool fp8_only = argc == 2 && std::string(argv[1]) == "--fp8-only";
+    if (argc != 1 && !fp8_only) {
+        std::cerr << "usage: ninfer_gdn_input_proj_test [--fp8-only]\n";
+        return 2;
+    }
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }
 
     int failures = 0;
-    failures += run_q4_q5();
-    failures += run_t2();
-    failures += run_q8();
-    failures += run_nvfp4();
+    if (!fp8_only) {
+        failures += run_q4_q5();
+        failures += run_t2();
+        failures += run_q8();
+        failures += run_nvfp4();
+    }
     failures += run_fp8();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_input_proj\n";
     return failures == 0 ? 0 : 1;

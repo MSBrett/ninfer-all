@@ -1,6 +1,7 @@
 target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/fp8_format.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/fp8_a8.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/fp8_rmsnorm_a8.cu"
   "${CMAKE_CURRENT_LIST_DIR}/fp8_dispatch.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n14336_k5120.cu"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n14336_k5120_unified.cu"
@@ -12,6 +13,8 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n5120_k6144_unified.cu"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n5120_k17408.cu"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n5120_k17408_unified.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/shapes/n131072_k5120.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/shapes/n131072_k5120_unified.cu"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n248320_k5120.cu"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n248320_k5120_unified.cu"
 )

@@ -1,9 +1,7 @@
 // sm_86 replacements for the FP8 A8 compute path.
 //
-// Every FP8 A8 route bottoms out in mma_fp8_e4m3, which emits
-// `mma.sync.aligned.kind::f8f6f4.m16n8k32.row.col.f32.e4m3.e4m3.f32`. The `kind::f8f6f4`
-// qualifier is a Blackwell (sm_100a/sm_120a) instruction; Ampere has no FP8 tensor-core path at
-// all, so the owning translation units cannot be compiled for sm_86 and are filtered out of
+// Ada has ordinary FP8 MMA and Blackwell has its own FP8 instruction form. Ampere has
+// neither, so the owning A8 translation units are filtered out of
 // ninfer_ops. These definitions keep the Op boundary link-complete and convert a mis-selected
 // route into a precise runtime error instead of a link failure.
 //
@@ -33,7 +31,7 @@ namespace ninfer::ops::detail {
 namespace {
 
 [[noreturn]] void reject_fp8_a8() {
-    throw std::runtime_error("FP8 A8 execution requires an sm_100a or sm_120a GPU");
+    throw std::runtime_error("FP8 A8 execution requires an sm_89 or sm_120a GPU");
 }
 
 } // namespace
@@ -44,8 +42,18 @@ void launch_fp8_a8_quantize(const Tensor&, const Weight&, Fp8A8Workspace, cudaSt
     reject_fp8_a8();
 }
 
+void launch_fp8_a8_fused_rmsnorm(const Tensor&, const Tensor&, float, Fp8A8Workspace,
+                                 cudaStream_t, const Tensor*, Tensor*) {
+    reject_fp8_a8();
+}
+
 void fp8_attn_input_a8_launch(const Tensor&, const Weight&, Tensor&, Tensor&, Tensor&, Tensor&,
                               Fp8A8Workspace, cudaStream_t) {
+    reject_fp8_a8();
+}
+
+void fp8_attn_input_a8_prequantized_launch(const Tensor&, const Weight&, Tensor&, Tensor&, Tensor&,
+                                           Tensor&, Fp8A8Workspace, cudaStream_t) {
     reject_fp8_a8();
 }
 
@@ -69,6 +77,11 @@ namespace unified {
 
 void fp8_attn_input_a8_launch(const Tensor&, const Weight&, Tensor&, Tensor&, Tensor&, Tensor&,
                               Fp8A8Workspace, cudaStream_t) {
+    reject_fp8_a8();
+}
+
+void fp8_attn_input_a8_prequantized_launch(const Tensor&, const Weight&, Tensor&, Tensor&, Tensor&,
+                                           Tensor&, Fp8A8Workspace, cudaStream_t) {
     reject_fp8_a8();
 }
 

@@ -7,6 +7,8 @@ namespace ninfer::models::qwen3_5::execution {
 
 class NativeExpertRuntime;
 
+// Native Q8 dense MTP composes LinearSwiGLU and LinearAdd, sharing their workspace
+// and numerical contracts. Gate/up and down projections have no extra BF16 materializations.
 // `verify` selects the Verify-phase gate_up policy (DenseParameters::verify_gate_up_policy).
 [[nodiscard]] std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t first,
                                               std::int32_t last, bool mtp = false,

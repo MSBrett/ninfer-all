@@ -4,6 +4,7 @@
 #include "core/arena.h"
 #include "core/layout.h"
 #include "core/tensor.h"
+#include "ops/common/device_tier.h"
 
 #include <cuda_runtime.h>
 
@@ -18,6 +19,7 @@ struct Fp8A8Workspace {
     std::uint8_t* codes = nullptr;
     float* scales       = nullptr;
     float* partials     = nullptr;
+    float* centers      = nullptr; // Ada affine FP8 only; Blackwell/TMA remains uncentered.
 };
 
 inline std::size_t fp8_a8_checked_bytes(std::int32_t tokens, std::size_t bytes_per_token) {
@@ -38,9 +40,14 @@ Fp8A8Workspace allocate_fp8_a8_workspace(Arena& arena, std::int32_t tokens, std:
     const DeviceSpan codes =
         arena.alloc_bytes(fp8_a8_checked_bytes(tokens, static_cast<std::size_t>(input_rows)), 256);
     const DeviceSpan scales = arena.alloc_bytes(fp8_a8_checked_bytes(tokens, sizeof(float)), 256);
+    float* centers = current_device_ada_fp8()
+                         ? static_cast<float*>(arena.alloc_bytes(
+                               fp8_a8_checked_bytes(tokens, sizeof(float)), 256).data)
+                         : nullptr;
     float* partials =
         partial_bytes ? static_cast<float*>(arena.alloc_bytes(partial_bytes, 256).data) : nullptr;
-    return {static_cast<std::uint8_t*>(codes.data), static_cast<float*>(scales.data), partials};
+    return {static_cast<std::uint8_t*>(codes.data), static_cast<float*>(scales.data), partials,
+            centers};
 }
 
 inline std::size_t fp8_a8_workspace_capacity_bytes(std::int32_t tokens, std::int32_t input_rows,
@@ -52,6 +59,10 @@ inline std::size_t fp8_a8_workspace_capacity_bytes(std::int32_t tokens, std::int
 
 void launch_fp8_a8_quantize(const Tensor& x, const Weight& weight, Fp8A8Workspace workspace,
                             cudaStream_t stream);
+
+void launch_fp8_a8_fused_rmsnorm(const Tensor& input, const Tensor& norm_weight, float eps,
+                                 Fp8A8Workspace workspace, cudaStream_t stream,
+                                 const Tensor* residual, Tensor* residual_sum);
 
 
 } // namespace ninfer::ops::detail

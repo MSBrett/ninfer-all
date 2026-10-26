@@ -22,6 +22,8 @@
 #include "ops/linear_swiglu/q8/q8_linear_swiglu_plan.h"
 
 #include <algorithm>
+#include <array>
+#include <cmath>
 #include <cstdint>
 #include <stdexcept>
 
@@ -235,7 +237,7 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
     }
 
     if (nvfp4_weight) {
-        (void)detail::validate_nvfp4_weight(gate_up_weight, "nvfp4 linear_swiglu");
+        (void)detail::validate_nvfp4_weight(gate_up_weight, "nvfp4 linear_swiglu", true);
         detail::nvfp4_linear_swiglu_dispatch(x, gate_up_weight, out, policy, ws, stream);
         return;
     }

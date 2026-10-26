@@ -887,19 +887,24 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     const auto projection        = workspace::text_attention_projection(work_, config_, T);
     const Tensor& input_signs    = projection_signs(p.projection);
     const InputBasis input_basis = rotated(input_signs) ? InputBasis::Rotated : InputBasis::Primal;
-    // The NVFP4 W4A4 route can normalize while it quantizes, which skips the BF16 round trip of
-    // the normalized hidden state, so only the other routes stage it.
+    // Both fused routes avoid staging the normalized hidden state. FP8 retains the ordinary
+    // BF16 normalization rounding inside its producer before quantizing the full row.
     const auto* single     = std::get_if<LinearParameters>(&p.projection);
     const bool fused_nvfp4 = input_basis == InputBasis::Primal && single != nullptr &&
                              ops::attn_input_proj_fused_rmsnorm_nvfp4_eligible(single->weight,
                                                                                single->policy, T);
+    const bool fused_fp8 = input_basis == InputBasis::Primal && single != nullptr &&
+                           single->weight.qtype == QType::FP8_E4M3FN_ROW_BF16 &&
+                           ops::attn_input_proj_fused_rmsnorm_fp8_eligible(single->weight,
+                                                                         single->policy, T);
+    const bool fused_norm = fused_nvfp4 || fused_fp8;
     Tensor h;
-    if (!fused_nvfp4) {
+    if (!fused_norm) {
         h = workspace::matrix(work_, DType::BF16, dimension(config_.hidden_size), T);
     }
     if (input_basis == InputBasis::Rotated) {
         ops::rmsnorm_hadamard(x, w.input_norm, config_.rms_norm_eps, true, input_signs, h, s);
-    } else if (!fused_nvfp4) {
+    } else if (!fused_norm) {
         ops::rmsnorm(x, w.input_norm, config_.rms_norm_eps, true, h, s);
     }
 
@@ -919,6 +924,11 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
         ops::attn_input_proj_fused_rmsnorm_nvfp4(x, w.input_norm, config_.rms_norm_eps,
                                                  single->weight, q_flat, gate_flat, k_flat, v_flat,
                                                  single->policy, work_, s);
+    } else if (fused_fp8) {
+        // x already includes the preceding residual update; do not split that fused update.
+        ops::attn_input_proj_fused_rmsnorm_fp8(x, w.input_norm, config_.rms_norm_eps,
+                                              single->weight, q_flat, gate_flat, k_flat, v_flat,
+                                              single->policy, work_, s);
     } else {
         attention_projection(h, p, q_flat, gate_flat, k_flat, v_flat, work_, s, input_basis);
     }

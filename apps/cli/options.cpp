@@ -242,6 +242,8 @@ std::string usage_text(const char* argv0) {
            "  --gdn-state-fp16              keep the GDN recurrent state in FP16\n"
            "  --mlp-a8-decode               integer-activation MLP gate_up at decode and\n"
            "                                verify widths\n"
+           "  --no-fp8-compute              use A16 activations for FP8/NVFP4 weights;\n"
+           "                                retain their compressed storage\n"
            "  --no-prefill-a8               return full prefill tiles to their A16 routes,\n"
            "                                which is how the integer routes are measured on\n"
            "                                a whole request\n"
@@ -455,6 +457,8 @@ Options parse_options(int argc, char** argv) {
             options.wddm_evictable_budget = true;
         } else if (arg == "--mlp-a8-decode") {
             options.mlp_a8_decode = true;
+        } else if (arg == "--no-fp8-compute") {
+            options.no_fp8_compute = true;
         } else if (arg == "--no-prefill-a8") {
             options.prefill_a8 = false;
         } else if (arg == "--lookup-ngram") {
