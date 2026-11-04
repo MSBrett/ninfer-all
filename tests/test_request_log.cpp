@@ -755,6 +755,12 @@ int main() {
     throughput.previous.salvaged_continuations          = 1;
     throughput.current.salvaged_continuations           = 3;
     throughput.current.engine_recoveries                = 3;
+    throughput.previous.disk_kv = {.enabled = true, .direct_storage = true,
+                                   .restored_pages = 4, .direct_storage_pages = 4};
+    throughput.current.disk_kv = {.enabled = true, .direct_storage = true,
+                                  .restored_pages = 10, .restored_bytes = 4096,
+                                  .restore_misses = 1, .direct_storage_pages = 8,
+                                  .direct_storage_fallbacks = 1};
     throughput.current.host_work                        = {
                                .engine_boundary_ns            = 1000000,
                                .program_submit_ns             = 2000000,
@@ -803,6 +809,11 @@ int main() {
     const Json throughput_json =
         Json::parse(format_throughput_json("serve-test", 5000, throughput));
     failures += check(throughput_json.at("event") == "throughput", "throughput event mismatch");
+    const auto& disk = throughput_json.at("context_cache").at("disk");
+    failures += check(disk.at("directstorage") == true && disk.at("restored_pages") == 6 &&
+                          disk.at("directstorage_pages") == 4 && disk.at("directstorage_fallbacks") == 1 &&
+                          disk.at("restore_misses") == 1,
+                      "disk log must report interval deltas and distinguish fallback from SDK reads");
     failures += check(throughput_json.at("tokens").at("computed_prefill") == 100 &&
                           throughput_json.at("tokens").at("committed_decode") == 40,
                       "throughput token deltas mismatch");

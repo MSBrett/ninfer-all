@@ -59,6 +59,11 @@ int main() {
     sample.stats.cancelled_prefills_salvaged   = 1;
     sample.stats.paced_prefill_steps           = 3;
     sample.stats.paced_prefill_deferred_tokens = 4608;
+    sample.stats.disk_kv = {.enabled = true, .direct_storage = true,
+                           .spilled_pages = 12, .spilled_bytes = 8192,
+                           .restored_pages = 10, .restored_bytes = 4096,
+                           .restore_misses = 2, .direct_storage_pages = 7,
+                           .direct_storage_fallbacks = 1};
 
     ServeMetrics metrics;
     GenerationOutcome outcome;
@@ -109,6 +114,15 @@ int main() {
                           values.at("ninfer:engine_recoveries_total") == 1.0,
                       "ninfer series accumulate reuse, speculation and recoveries");
     const auto at = [&](const char* series) { return values.at(series); };
+    failures += check(at("ninfer:disk_kv_enabled") == 1.0 &&
+                          at("ninfer:disk_kv_directstorage_enabled") == 1.0 &&
+                          at("ninfer:disk_kv_spilled_pages_total") == 12.0 &&
+                          at("ninfer:disk_kv_restored_pages_total") == 10.0 &&
+                          at("ninfer:disk_kv_restored_bytes_total") == 4096.0 &&
+                          at("ninfer:disk_kv_restore_misses_total") == 2.0 &&
+                          at("ninfer:disk_kv_directstorage_pages_total") == 7.0 &&
+                          at("ninfer:disk_kv_directstorage_fallbacks_total") == 1.0,
+                      "disk metrics distinguish actual DirectStorage reads from ordinary fallback");
     failures += check(at("ninfer:context_selections_total{source=\"root\"}") == 3.0 &&
                           at("ninfer:context_selections_total"
                              "{source=\"private_endpoint\"}") == 9.0 &&

@@ -93,7 +93,7 @@ build option, untested:
 
 | option | effect |
 |---|---|
-| `NINFER_DIRECTSTORAGE=ON` | fetches the DirectStorage 1.3 runtime and offers `--disk-kv-directstorage` for disk-tier restores |
+| `NINFER_DIRECTSTORAGE=ON` | fetches the DirectStorage 1.3 runtime and offers `--disk-kv-directstorage` for disk-tier restores; run `ninfer_directstorage_test` to qualify the reader |
 
 The other build options are in the [Linux guide](build-linux.md#build-options).
 

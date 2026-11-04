@@ -100,6 +100,11 @@ ThroughputReport make_throughput_report(const ninfer::RuntimeStats& previous,
 
 bool report_has_activity(const ThroughputReport& report) {
     return report.computed_prefill_tokens != 0 || report.committed_decode_tokens != 0 ||
+           report.current.disk_kv.spilled_pages != report.previous.disk_kv.spilled_pages ||
+           report.current.disk_kv.restored_pages != report.previous.disk_kv.restored_pages ||
+           report.current.disk_kv.restore_misses != report.previous.disk_kv.restore_misses ||
+           report.current.disk_kv.direct_storage_fallbacks !=
+               report.previous.disk_kv.direct_storage_fallbacks ||
            report.decode_rounds != 0 || report.current.running_requests != 0 ||
            report.current.waiting_requests != 0 || report.current.materializing_requests != 0 ||
            report.current.capture_pending_requests != 0 ||

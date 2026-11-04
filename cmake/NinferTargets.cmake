@@ -102,6 +102,9 @@ function(ninfer_runtime_dll_list out_var)
   if(WIN32 AND NINFER_WINDOWS_KERNEL_DLL AND TARGET ninfer_kernels)
     list(APPEND _list "$<TARGET_FILE:ninfer_kernels>")
   endif()
+  if(WIN32 AND NINFER_DIRECTSTORAGE)
+    list(APPEND _list ${NINFER_DIRECTSTORAGE_DLLS})
+  endif()
   if(WIN32 AND DEFINED FFMPEG_VCPKG_TREE)
     foreach(_ninfer_dll_glob
       "avutil-*.dll" "avcodec-*.dll" "avformat-*.dll" "swscale-*.dll"

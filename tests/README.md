@@ -55,6 +55,11 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
+With `NINFER_DIRECTSTORAGE=ON` on Windows, also build and run
+`ninfer_directstorage_test`. It exercises real SDK reads, queue boundaries, invalid ranges,
+concurrent callers, retained immutable files, and timeout buffer lifetime. This is a host
+qualification; it does not qualify GPU inference throughput.
+
 On a machine without a usable CUDA device -- no GPU, an old driver, or only the CUDA toolkit's stub
 `libcuda` (`LD_LIBRARY_PATH` pointing at a directory with `libcuda.so.1` linked to
 `$CUDA_HOME/lib64/stubs/libcuda.so`, as CI does) -- every test that needs a device reports as

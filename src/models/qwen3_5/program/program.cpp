@@ -757,6 +757,22 @@ ExpertResidencyStats Program::expert_residency_stats() const {
     return out;
 }
 
+DiskKVStats Program::disk_kv_stats() const {
+    if (!impl_->disk_kv) { return {}; }
+    const auto stats = impl_->disk_kv->stats();
+    return {
+        .enabled = true,
+        .direct_storage = impl_->context_cache.disk_kv_directstorage,
+        .spilled_pages = stats.spills,
+        .spilled_bytes = stats.spill_bytes,
+        .restored_pages = stats.restores,
+        .restored_bytes = stats.restore_bytes,
+        .restore_misses = stats.restore_misses,
+        .direct_storage_pages = stats.direct_storage_restores,
+        .direct_storage_fallbacks = stats.direct_storage_fallbacks,
+    };
+}
+
 std::uint32_t Program::concurrent_output_budget(std::uint32_t prompt_tokens) const noexcept {
     return impl_->concurrent_output_budget(prompt_tokens);
 }

@@ -6,6 +6,7 @@
 #include <optional>
 #endif
 #include <charconv>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -13,8 +14,14 @@
 #include <iostream>
 #include <sstream>
 #include <string_view>
+#include <utility>
 #ifdef _WIN32
 #include <windows.h>
+// The SDK resolves its core DLL relative to the executable, even when dstorage.dll lives
+// beside a selected backend. Set the documented executable export before entering that backend.
+extern "C" {
+__declspec(dllexport) const char* DStorageSDKPath = ".\\";
+}
 #else
 #include <dlfcn.h>
 #include <unistd.h>
@@ -84,6 +91,7 @@ struct Options {
     int requested = 0;
     std::vector<int> devices{0};
     std::vector<char*> arguments;
+    std::vector<std::pair<std::string, std::string>> environment;
 #ifdef NINFER_ROUTER_LAUNCHER
     std::optional<fs::path> models_directory;
     std::optional<fs::path> models_preset;
@@ -96,6 +104,15 @@ Options parse(int argc, char** argv) {
     options.arguments.push_back(argv[0]);
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg(argv[i]);
+        if (arg == "--env") {
+            if (++i == argc) throw std::runtime_error("--env requires NAME=VALUE");
+            const std::string_view value(argv[i]);
+            const auto equals = value.find('=');
+            if (equals == 0 || equals == std::string_view::npos)
+                throw std::runtime_error("--env requires NAME=VALUE");
+            options.environment.emplace_back(value.substr(0, equals), value.substr(equals + 1));
+            continue;
+        }
         if (arg == "--cuda-backend" || arg.starts_with("--cuda-backend=")) {
             if (backend_seen) throw std::runtime_error("Specify --cuda-backend once");
             backend_seen = true;
@@ -139,6 +156,7 @@ Options parse(int argc, char** argv) {
                  arg == "--thinking-budget-message" || arg == "--slot-save-path" ||
                  arg == "--models-dir" || arg == "--models-preset" || arg == "--graft" ||
                  arg == "--default-graft" || arg == "--ngram-table" || arg == "--ngram-profile" ||
+                 arg == "--ngram-hot-profile" || arg == "--expert-profile" || arg == "--expert-profile-out" ||
                  arg == "--corpus" || arg == "--text" || arg == "--output" ||
                  arg == "--weights" || arg == "-m" || arg == "-f" || arg == "--output-file" ||
                  arg == "--out" || arg == "--evaluate") {
@@ -247,6 +265,14 @@ ninfer::launcher::Backend configuration(const fs::path& root, int major, bool pr
 int main(int argc, char** argv) {
     try {
         auto options = parse(argc, argv);
+        for (const auto& [name, value] : options.environment) {
+#ifdef _WIN32
+            const int result = _putenv_s(name.c_str(), value.c_str());
+#else
+            const int result = value.empty() ? unsetenv(name.c_str()) : setenv(name.c_str(), value.c_str(), 1);
+#endif
+            if (result != 0) throw std::runtime_error("Cannot set launch environment: " + name);
+        }
         const auto root = executable().parent_path();
         const bool help = options.arguments.size() >= 2 &&
             (std::string_view(options.arguments[1]) == "--help" ||
@@ -260,6 +286,7 @@ int main(int argc, char** argv) {
             if (text) {
                 std::cout << text.rdbuf();
                 std::cout << "\n  --cuda-backend auto|12|13     select a packaged CUDA backend (default auto)\n";
+                std::cout << "  --env NAME=VALUE             override launch environment; repeatable, empty clears\n";
                 return 0;
             }
         }
@@ -280,6 +307,10 @@ int main(int argc, char** argv) {
                                                 hardware.architectures, has12, has13,
                                                 configuration(root, 12, has12), configuration(root, 13, has13));
         }
+#ifdef _WIN32
+        const std::string storage_path = ".\\backends\\cuda" + std::to_string(selected) + "\\";
+        DStorageSDKPath = storage_path.c_str();
+#endif
         auto module = load(runtime(root, selected));
         using BuildId = const char*(*)();
         if (std::strcmp(symbol<BuildId>(module, "ninfer_backend_build_id_v1")(), NINFER_BUILD_ID))
@@ -291,7 +322,12 @@ int main(int argc, char** argv) {
         if (help) options.arguments[0] = help_command.data();
         const int count = static_cast<int>(options.arguments.size());
         options.arguments.push_back(nullptr);
-        return entry(NINFER_COMMAND, count, options.arguments.data());
+        const int result = entry(NINFER_COMMAND, count, options.arguments.data());
+        if (help) {
+            std::cout << "\n  --cuda-backend auto|12|13     select a packaged CUDA backend (default auto)\n"
+                         "  --env NAME=VALUE             override launch environment; repeatable, empty clears\n";
+        }
+        return result;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "%s: %s\n", NINFER_COMMAND, error.what());
         return 1;

@@ -907,6 +907,9 @@ private:
         if constexpr (requires { instance_.program->expert_residency_stats(); }) {
             snapshot.experts = instance_.program->expert_residency_stats();
         }
+        if constexpr (requires { instance_.program->disk_kv_stats(); }) {
+            snapshot.disk_kv = instance_.program->disk_kv_stats();
+        }
         {
             std::lock_guard lock(queue_mutex_);
             snapshot.waiting_requests = static_cast<std::uint32_t>(pending_.size());
