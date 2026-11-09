@@ -37,6 +37,27 @@ void append_sample(std::string& out, const char* name, const std::string& labels
 // from: `root` is a miss (a prefill from token zero), every other source a reuse, so the hit rate
 // is 1 - root / all. Pressure events are what planning did to inactive owners to make room.
 void append_context_cache(std::string& out, const ninfer::RuntimeStats& stats) {
+    const auto& disk = stats.disk_kv;
+    append(out, "ninfer:disk_kv_enabled", "gauge", "Whether the disk KV tier is open.", disk.enabled);
+    append(out, "ninfer:disk_kv_directstorage_enabled", "gauge",
+           "Whether disk KV restores request DirectStorage.", disk.direct_storage);
+    append(out, "ninfer:disk_kv_spilled_pages_total", "counter",
+           "Payload pages written to the disk tier, including state images.",
+           static_cast<double>(disk.spilled_pages));
+    append(out, "ninfer:disk_kv_spilled_bytes_total", "counter", "Payload bytes written to the disk tier.",
+           static_cast<double>(disk.spilled_bytes));
+    append(out, "ninfer:disk_kv_restored_pages_total", "counter", "Disk pages restored and CRC verified.",
+           static_cast<double>(disk.restored_pages));
+    append(out, "ninfer:disk_kv_restored_bytes_total", "counter", "Payload bytes restored from disk.",
+           static_cast<double>(disk.restored_bytes));
+    append(out, "ninfer:disk_kv_restore_misses_total", "counter", "Missing or corrupt disk restore batches.",
+           static_cast<double>(disk.restore_misses));
+    append(out, "ninfer:disk_kv_directstorage_pages_total", "counter",
+           "Pages actually restored through DirectStorage and CRC verified.",
+           static_cast<double>(disk.direct_storage_pages));
+    append(out, "ninfer:disk_kv_directstorage_fallbacks_total", "counter",
+           "DirectStorage restore batches retried with ordinary file reads.",
+           static_cast<double>(disk.direct_storage_fallbacks));
     const char* selections = "ninfer:context_selections_total";
     append_family(out, selections, "counter",
                   "Admissions by the context-cache source they started from; root is a miss.");

@@ -1201,6 +1201,20 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                            {"shared_active_references", current.shared_active_references}}},
         {"actual_transfer_seconds", monotonic_delta(previous.actual_context_transfer_seconds,
                                                     current.actual_context_transfer_seconds)}};
+    if (current.disk_kv.enabled) {
+        const auto& now = current.disk_kv;
+        const auto& then = previous.disk_kv;
+        record["context_cache"]["disk"] = Json{
+            {"directstorage", now.direct_storage},
+            {"spilled_pages", monotonic_delta(then.spilled_pages, now.spilled_pages)},
+            {"spilled_bytes", monotonic_delta(then.spilled_bytes, now.spilled_bytes)},
+            {"restored_pages", monotonic_delta(then.restored_pages, now.restored_pages)},
+            {"restored_bytes", monotonic_delta(then.restored_bytes, now.restored_bytes)},
+            {"restore_misses", monotonic_delta(then.restore_misses, now.restore_misses)},
+            {"directstorage_pages", monotonic_delta(then.direct_storage_pages, now.direct_storage_pages)},
+            {"directstorage_fallbacks", monotonic_delta(then.direct_storage_fallbacks, now.direct_storage_fallbacks)},
+        };
+    }
     // Hybrid prefix cache (--use-alt-prefix-caching): absolute occupancy, per-interval events.
     if (current.hybrid_snapshots != 0 || current.hybrid_tree_blocks != 0 ||
         current.hybrid_blocks_inserted != 0) {

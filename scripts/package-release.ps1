@@ -1,5 +1,7 @@
 # Package the configured Windows build. CUDA and architecture labels come from its build tree.
 # Example: $env:NINFER_BUILD_ROOT = 'C:\ninfer\build-release'; ./scripts/package-release.ps1
+param([string]$Cuobjdump = '')
+
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $RepoRoot = Split-Path -Parent $PSScriptRoot
@@ -101,7 +103,12 @@ if ($VcpkgEntry.Count -eq 1) {
         Copy-Item -LiteralPath $notice.FullName -Destination (Join-Path $ProductRoot "LICENSE-$name.txt")
     }
 }
-$Cuobjdump = Join-Path $CudaRoot 'bin\cuobjdump.exe'
+if (-not $Cuobjdump) { $Cuobjdump = Join-Path $CudaRoot 'bin\cuobjdump.exe' }
+if (-not (Test-Path -LiteralPath $Cuobjdump -PathType Leaf)) {
+    throw "Missing CUDA image inspector: $Cuobjdump; pass -Cuobjdump with an installed cuobjdump.exe"
+}
+$Cuobjdump = (Resolve-Path -LiteralPath $Cuobjdump).Path
+Write-Host "CUDA image inspector: $Cuobjdump"
 # The Windows loader refuses an image whose SizeOfImage passes 0x77000000 (1904 MiB): LoadLibrary
 # then fails with error 193 although the file is well below the linker's 2 GiB.
 $MaximumImageBytes = 0x77000000

@@ -75,6 +75,14 @@ ninfer_add_test(ninfer_disk_kv_bridge_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_disk_kv_bridge.cpp"
   LIBRARIES ninfer_core)
 
+ninfer_add_test(ninfer_directstorage_test STANDALONE
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_direct_storage_reader.cpp"
+  LIBRARIES ninfer_core)
+ninfer_stage_test_runtime_dlls(ninfer_directstorage_test)
+if(WIN32 AND NINFER_DIRECTSTORAGE)
+  target_compile_definitions(ninfer_directstorage_test PRIVATE NINFER_DIRECTSTORAGE=1)
+endif()
+
 ninfer_add_test(ninfer_device_test       SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_device.cu"
   LIBRARIES ninfer_ops)
 

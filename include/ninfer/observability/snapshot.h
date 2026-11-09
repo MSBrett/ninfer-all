@@ -53,10 +53,25 @@ struct ResidencyStatus {
     std::string last_error;
 };
 
+// Disk-tier payload counters, including state images. A restored page has passed its CRC;
+// DirectStorage pages are a subset of restores, never attempts or ordinary fallback reads.
+struct DiskKVStats {
+    bool enabled = false;
+    bool direct_storage = false;
+    std::uint64_t spilled_pages = 0;
+    std::uint64_t spilled_bytes = 0;
+    std::uint64_t restored_pages = 0;
+    std::uint64_t restored_bytes = 0;
+    std::uint64_t restore_misses = 0;
+    std::uint64_t direct_storage_pages = 0;
+    std::uint64_t direct_storage_fallbacks = 0; // batches retried with ordinary reads
+};
+
 // Monotonic execution counters, boundary-consistent current gauges, and explicitly named last
 // decision observations. Consumers derive interval counters by subtracting two snapshots.
 struct RuntimeStats {
     RuntimeHostWorkStats host_work;
+    DiskKVStats disk_kv;
     // Actual prompt tokens evaluated by prefill; reused checkpoint-prefix tokens are excluded.
     std::uint64_t computed_prefill_tokens = 0;
     // Tokens committed by decode rounds; the first token emitted by prefill is excluded.

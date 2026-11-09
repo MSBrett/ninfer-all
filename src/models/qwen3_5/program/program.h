@@ -1280,6 +1280,7 @@ public:
     [[nodiscard]] PhysicalUsageSnapshot physical_usage() const noexcept;
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
     [[nodiscard]] ExpertResidencyStats expert_residency_stats() const;
+    [[nodiscard]] DiskKVStats disk_kv_stats() const;
     // Largest output budget for a prompt of `prompt_tokens` whose admission entitlement (main KV and
     // any MTP/DFlash backend KV, draft window included) fits one lane's share of each pool beside
     // the pages the context cache's snapshot tails take, so that every configured lane can hold
